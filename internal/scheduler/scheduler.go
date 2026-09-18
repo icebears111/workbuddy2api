@@ -217,8 +217,9 @@ func (s *Scheduler) signOne(uid string) {
 	default:
 		log.Printf("auto checkin %s: %s", uid, it.Msg)
 	}
-	// 记录当天签到状态（code==10001 说明今天已被签，同样记为已签）
-	if it.OK || it.Code == 10001 {
+	// 记录当天签到状态：含「今天已签到」的幂等命中；
+	// saas 域的 code==10001 是「签到活动未开启」，不算已签（见 checkin.Item.AlreadySigned）。
+	if it.AlreadySigned() {
 		checkin.Record(s.cfg.AuthDir, uid, true, it.Credit, it.StreakDays)
 	}
 	s.cfg.Pool.SaveState()

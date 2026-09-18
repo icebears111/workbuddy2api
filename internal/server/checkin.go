@@ -20,8 +20,10 @@ func (h *Handler) apiCheckin(w http.ResponseWriter, r *http.Request) {
 		if it.Skipped {
 			continue
 		}
-		// code==10001 说明今天已被签（网关或官方客户端），同样视为已签
-		signedToday := it.OK || it.Code == 10001
+		// 已签：本次签成功，或上游表示「今天已签到」。
+		// 注意不能只看 code==10001——saas 域的 10001 是「签到活动未开启或已过期」，
+		// 详见 checkin.Item.AlreadySigned。
+		signedToday := it.AlreadySigned()
 		if it.OK {
 			signed++
 		}

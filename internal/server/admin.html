@@ -246,8 +246,8 @@ pre{background:rgba(10,12,31,.05);border:1px solid var(--line);border-radius:var
       </div>
       <div class="hint" style="margin-bottom:8px"><b>OpenAI Chat 客户端</b>（Cherry Studio / LobeChat / NextChat / Open WebUI 等）— 把上面两项填进客户端即可，模型名填 <span class="mono">/v1/models</span> 返回的 <span class="mono">id</span>：</div>
       <pre class="mono" id="ex-curl"></pre>
-      <div class="hint" style="margin-top:12px;margin-bottom:8px"><b>Claude Code / Codex CLI</b> — <b>不能直连本网关</b>：本网关只提供 OpenAI Chat，<span class="mono">/v1/messages</span>、<span class="mono">/v1/messages/count_tokens</span>、<span class="mono">/v1/responses</span> 已下线（请求返回 <span class="mono">410 Gone</span>）。请先在中间套一层转换层（CC Switch / claude-code-router / LiteLLM）把 Anthropic / Responses 转成 OpenAI Chat，再让转换层把 Base URL 指向本网关。</div>
-      <div class="hint" style="margin-top:10px">鉴权：<span class="mono">Authorization: Bearer &lt;API Key&gt;</span>（或 <span class="mono">x-api-key</span>）。端点表：<span class="mono">POST /v1/chat/completions</span>（OpenAI Chat）、<span class="mono">GET /v1/models</span>；其余协议端点一律 <span class="mono">410 Gone</span>。</div>
+      <div class="hint" id="hint-protocols" style="margin-top:12px;margin-bottom:8px"><b>Claude Code / Codex CLI</b> — <b>不能直连本网关</b>：本网关只提供 OpenAI Chat，<span class="mono">/v1/messages</span>、<span class="mono">/v1/messages/count_tokens</span>、<span class="mono">/v1/responses</span> 已下线（请求返回 <span class="mono">410 Gone</span>）。请先在中间套一层转换层（CC Switch / claude-code-router / LiteLLM）把 Anthropic / Responses 转成 OpenAI Chat，再让转换层把 Base URL 指向本网关。</div>
+      <div class="hint" id="hint-endpoints" style="margin-top:10px">鉴权：<span class="mono">Authorization: Bearer &lt;API Key&gt;</span>（或 <span class="mono">x-api-key</span>）。端点表：<span class="mono">POST /v1/chat/completions</span>（OpenAI Chat）、<span class="mono">GET /v1/models</span>；其余协议端点一律 <span class="mono">410 Gone</span>。</div>
     </div>
   </div>
 </div>
@@ -343,8 +343,43 @@ async function loadStatus(){
     $('hint-authdir').textContent = (d.auth_dir||'auths/').replace(/\\/g,'/').split('/').slice(-2).join('/');
     $('m-upstream').innerHTML = '<span class="dot" style="color:#0ea5e9"></span>上游 ' + esc(d.upstream_base||'—');
     $('m-health').innerHTML = '<span class="dot" style="color:'+(d.healthy>0?'var(--ok)':'var(--warn)')+'"></span>健康 '+esc(d.healthy)+'/'+esc(d.total);
+    renderProtocolHint(d);
     renderAcctRows();
   }catch(e){ $('m-health').innerHTML = '<span class="dot" style="color:var(--bad)"></span>状态获取失败'; }
+}
+
+/* 接入指引必须跟着运行时配置走：开关打开时 Claude Code / Codex CLI 可直连本网关，
+   此时页面若还写「不能直连」就是错的（反之亦然）。这两个开关来自 /api/status。 */
+function renderProtocolHint(d){
+  const anth = !!d.anthropic_protocol, resp = !!d.responses_protocol;
+  const k = s => '<span class="mono">'+s+'</span>';
+  let html;
+  if (anth || resp) {
+    const cli = [anth?'Claude Code / Claude Desktop':'', resp?'Codex CLI':''].filter(Boolean).join(' / ');
+    const eps = [anth?k('/v1/messages')+'、'+k('/v1/messages/count_tokens'):'', resp?k('/v1/responses'):'']
+      .filter(Boolean).join('、');
+    html = '<b>'+cli+'</b> — <b>可直连本网关</b>：'+eps+' 已开放，<b>无需转换层</b>。'
+         + '把 '+k('ANTHROPIC_BASE_URL')+' 设为 '+k(BASE)+'、'+k('ANTHROPIC_AUTH_TOKEN')
+         + ' 设为上面的 API Key 即可（每开一个终端就是一份独立配置）。';
+  } else {
+    html = '<b>Claude Code / Codex CLI</b> — <b>不能直连本网关</b>：本网关只提供 OpenAI Chat，'
+         + k('/v1/messages')+'、'+k('/v1/messages/count_tokens')+'、'+k('/v1/responses')
+         + ' 已下线（请求返回 '+k('410 Gone')+'）。请先在中间套一层转换层（CC Switch / claude-code-router / LiteLLM）'
+         + '把 Anthropic / Responses 转成 OpenAI Chat，再让转换层把 Base URL 指向本网关。'
+         + '若要直连，在 '+k('config.json')+' 的 '+k('features')+' 段把 '
+         + k('enable_anthropic_protocol')+' / '+k('enable_responses_protocol')+' 置 true 后重启。';
+  }
+  $('hint-protocols').innerHTML = html;
+
+  const list = [k('POST /v1/chat/completions')+'（OpenAI Chat）', k('GET /v1/models')];
+  if (anth) list.push(k('POST /v1/messages')+'、'+k('POST /v1/messages/count_tokens')+'（Anthropic）');
+  if (resp) list.push(k('POST /v1/responses')+'（Responses）');
+  const gone = [];
+  if (!anth) gone.push('/v1/messages', '/v1/messages/count_tokens');
+  if (!resp) gone.push('/v1/responses');
+  $('hint-endpoints').innerHTML = '鉴权：'+k('Authorization: Bearer &lt;API Key&gt;')+'（或 '+k('x-api-key')+'）。端点表：'
+    + list.join('、') + '。'
+    + (gone.length ? '未开放的 '+gone.map(g=>k(g)).join('、')+' 一律 '+k('410 Gone')+'。' : '');
 }
 
 function ckChip(uid){
@@ -592,7 +627,7 @@ function loadKeys(){
 '  -H "Content-Type: application/json" \\\n'+
 '  -d \'{"model":"hy4-preview","messages":[{"role":"user","content":"你好"}]}\'\n\n'+
 '# 流式：请求体加 "stream": true（上游只支持流式，本服务自动聚合非流式）\n'+
-'# Claude Code / Codex CLI 不能直连；需先经转换层转成 OpenAI Chat（见下）';
+'# Claude Code / Codex CLI 等非 OpenAI 协议客户端的接入方式，见下方说明';
 }
 async function copyKey(){ if(!apiKey){ toast('未配置 API Key', false); return; } try{ await navigator.clipboard.writeText(apiKey); toast('API Key 已复制', true); }catch(e){} }
 async function copyBase(){ try{ await navigator.clipboard.writeText(BASE+'/v1'); toast('Base URL 已复制', true); }catch(e){} }

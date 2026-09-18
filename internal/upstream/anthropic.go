@@ -249,6 +249,7 @@ func usageTokens(u map[string]any) (int, int) {
 func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantThinking bool, flush func(), onUsage ...func(map[string]any)) error {
 	schemas := toolSchemas(tools)
 	msgID := newMessageID()
+	started := time.Now()
 	_ = writeAnthropicEvent(w, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -273,7 +274,16 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 	)
 
 	// 读完整段流：合并思考、收集正文 delta、合并工具调用。
+	// 注意：本实现刻意「先读完再下发」，因此客户端在 message_start 之后要一直等到
+	// 上游整段流结束才能看到第一个 content_block_delta。上游越慢（长思考、
+	// 大 system + 多工具），客户端空等越久，可能触发其流式空闲超时后重试。
+	// 这里记录首个 chunk 与整段流的耗时，便于定位这类「客户端只见重试、日志安静」的问题。
+	var firstChunk time.Time
 	err := ParseSSE(r, func(chunk map[string]any) error {
+		if firstChunk.IsZero() {
+			firstChunk = time.Now()
+			log.Printf("messages: upstream first chunk after %s", firstChunk.Sub(started).Round(time.Millisecond))
+		}
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			finalUsage = mergeUsage(finalUsage, u)
 		}
@@ -317,14 +327,19 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 	// signature 为占位符）会被 Claude Desktop 等严格客户端整条拒收。
 	if wantThinking && reasoning.Len() > 0 {
 		_ = writeAnthropicEvent(w, "content_block_start", map[string]any{
+			"type":          "content_block_start",
 			"index":         0,
 			"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": syntheticSignature},
 		}, flush)
 		_ = writeAnthropicEvent(w, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
 			"index": 0,
 			"delta": map[string]any{"type": "thinking_delta", "thinking": reasoning.String()},
 		}, flush)
-		_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{"index": 0}, flush)
+		_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": 0,
+		}, flush)
 	}
 
 	// text 块：逐 delta 回放，保持客户端流式渲染与「你好」「世界」分离。
@@ -334,16 +349,21 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 			idx = 1
 		}
 		_ = writeAnthropicEvent(w, "content_block_start", map[string]any{
+			"type":          "content_block_start",
 			"index":         idx,
 			"content_block": map[string]any{"type": "text", "text": ""},
 		}, flush)
 		for _, td := range textDeltas {
 			_ = writeAnthropicEvent(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
 				"index": idx,
 				"delta": map[string]any{"type": "text_delta", "text": td},
 			}, flush)
 		}
-		_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{"index": idx}, flush)
+		_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": idx,
+		}, flush)
 	}
 
 	// tool_use 块
@@ -362,6 +382,7 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 			argsJSON, _ := json.Marshal(vc.Input)
 			names = append(names, vc.Name+" id="+vc.ID+" args="+string(argsJSON))
 			_ = writeAnthropicEvent(w, "content_block_start", map[string]any{
+				"type":  "content_block_start",
 				"index": idx,
 				"content_block": map[string]any{
 					"type":  "tool_use",
@@ -371,10 +392,14 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 				},
 			}, flush)
 			_ = writeAnthropicEvent(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
 				"index": idx,
 				"delta": map[string]any{"type": "input_json_delta", "partial_json": string(argsJSON)},
 			}, flush)
-			_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{"index": idx}, flush)
+			_ = writeAnthropicEvent(w, "content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": idx,
+			}, flush)
 			idx++
 		}
 		log.Printf("messages stream tool_use: %s", strings.Join(names, "; "))
@@ -402,8 +427,13 @@ func StreamAsAnthropic(w io.Writer, r io.Reader, model string, tools any, wantTh
 	for _, d := range textDeltas {
 		textLen += len(d)
 	}
-	log.Printf("messages stream done: model=%s stop=%s text_len=%d tool_calls=%d reasoning_len=%d out_tokens=%d",
-		model, stopReason, textLen, len(validCalls), reasoning.Len(), outTokens)
+	upstreamWait := time.Duration(0)
+	if !firstChunk.IsZero() {
+		upstreamWait = firstChunk.Sub(started)
+	}
+	log.Printf("messages stream done: model=%s stop=%s text_len=%d tool_calls=%d reasoning_len=%d out_tokens=%d upstream_first=%s total=%s",
+		model, stopReason, textLen, len(validCalls), reasoning.Len(), outTokens,
+		upstreamWait.Round(time.Millisecond), time.Since(started).Round(time.Millisecond))
 
 	if len(onUsage) > 0 && finalUsage != nil {
 		onUsage[0](finalUsage)
@@ -452,26 +482,53 @@ func toolSchemas(tools any) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	arr, ok := tools.([]any)
 	if !ok {
+		// 诊断：tools 不是 []any（形态不符），会导致全部工具都拿不到 schema
+		// → conformToolInput 一律放行 → 幻觉字段透传给客户端触发严格校验失败。
+		if tools != nil {
+			log.Printf("toolSchemas: tools is %T (not []any), no schema resolved at all", tools)
+		}
 		return out
 	}
+	var total, noFn, noName, noProps, emptyProps int
+	var emptyNames []string
 	for _, it := range arr {
+		total++
 		tool, ok := it.(map[string]any)
 		if !ok {
+			noFn++
 			continue
 		}
 		fn, _ := tool["function"].(map[string]any)
 		if fn == nil {
+			noFn++
 			continue
 		}
 		name, _ := fn["name"].(string)
 		if name == "" {
+			noName++
 			continue
 		}
 		params, _ := fn["parameters"].(map[string]any)
 		props, _ := params["properties"].(map[string]any)
-		if props != nil {
-			out[name] = props
+		if props == nil {
+			noProps++
+			emptyNames = append(emptyNames, name)
+			continue
 		}
+		if len(props) == 0 {
+			emptyProps++
+			emptyNames = append(emptyNames, name)
+			continue
+		}
+		out[name] = props
+	}
+	// 诊断：noProps/noFn/noName 才是**异常**信号（工具定义残缺，会导致
+	// conformToolInput 拿不到 schema 而放行幻觉字段）。emptyProps 是**常态**——
+	// Claude Code 本就有若干无参工具（CronList / EnterPlanMode / TaskList 等
+	// 的空 properties 是合法的），不再据此打日志，避免每次请求刷屏。
+	if noProps > 0 || noFn > 0 || noName > 0 {
+		log.Printf("toolSchemas: total=%d resolved=%d noProps=%d emptyProps=%d noFn=%d noName=%d unresolved=%v",
+			total, len(out), noProps, emptyProps, noFn, noName, emptyNames)
 	}
 	return out
 }
@@ -483,6 +540,18 @@ func toolSchemas(tools any) map[string]map[string]any {
 // schema 是严格校验（additionalProperties: false），多一个未知字段就会报
 // "The model's tool call could not be parsed"。schema 未知的工具不做过滤。
 func conformToolInput(input map[string]any, props map[string]any) map[string]any {
+	// 诊断（只打日志，不改变行为）：schema 为空却收到参数是「幻觉字段被放行」
+	// 的高危信号——此时下方会原样返回，客户端严格校验可能报
+	// "The model's tool call could not be parsed"。留证据以便定位是
+	// 「工具本就无参」还是「input_schema 传输丢失」。
+	if len(props) == 0 && len(input) > 0 {
+		names := make([]string, 0, len(input))
+		for k := range input {
+			names = append(names, k)
+		}
+		log.Printf("conformToolInput: empty schema but %d field(s) present, passing through (no filtering): %v",
+			len(input), names)
+	}
 	if props == nil || len(props) == 0 || len(input) == 0 {
 		return input
 	}

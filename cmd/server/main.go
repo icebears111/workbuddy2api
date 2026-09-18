@@ -119,21 +119,23 @@ func main() {
 	}
 
 	h := server.NewHandler(server.Config{
-		Pool:          p,
-		Upstream:      up,
-		APIKey:        cfg.APIKey,
-		HardCooldown:  cfg.HardCreditDur,
-		SoftCooldown:  cfg.SoftRateDur,
-		ErrThreshold:  cfg.Cooldown.ErrThresh,
-		ErrCooldown:   cfg.ErrCooldownDur,
-		FallbackModel: cfg.FallbackModel,
-		AuthDir:       absAuthDir,
-		OnReload:      onReload,
-		OnAdd:         onAdd,
-		OnRemove:      onRemove,
-		TokenURL:      cfg.OAuth.TokenURL,
-		ClientID:      cfg.OAuth.ClientID,
-		Tracker:       usage.New(absUsageFile, cfg.QuotaLimit),
+		Pool:                    p,
+		Upstream:                up,
+		APIKey:                  cfg.APIKey,
+		HardCooldown:            cfg.HardCreditDur,
+		SoftCooldown:            cfg.SoftRateDur,
+		ErrThreshold:            cfg.Cooldown.ErrThresh,
+		ErrCooldown:             cfg.ErrCooldownDur,
+		FallbackModel:           cfg.FallbackModel,
+		EnableAnthropicProtocol: cfg.Features.EnableAnthropicProtocol,
+		EnableResponsesProtocol: cfg.Features.EnableResponsesProtocol,
+		AuthDir:                 absAuthDir,
+		OnReload:                onReload,
+		OnAdd:                   onAdd,
+		OnRemove:                onRemove,
+		TokenURL:                cfg.OAuth.TokenURL,
+		ClientID:                cfg.OAuth.ClientID,
+		Tracker:                 usage.New(absUsageFile, cfg.QuotaLimit),
 		Realms: map[string]server.RealmConfig{
 			// CN 控制台域（ck_ Key），沿用全局上游。
 			"cn": {
@@ -177,6 +179,8 @@ func main() {
 	log.Printf("codebuddy2api listening on %s (api_key=%v, upstream=%s)", cfg.Listen, cfg.APIKey != "", up.Base)
 	log.Printf("desensitize: enabled=%v tools=%v strip_tool_metadata=%v",
 		cfg.Features.Desensitize, cfg.Features.DesensitizeTools, cfg.Features.StripToolMetadata)
+	log.Printf("protocols: anthropic=%v responses=%v (false = 410 Gone, 需转换层)",
+		cfg.Features.EnableAnthropicProtocol, cfg.Features.EnableResponsesProtocol)
 	log.Printf("admin UI: http://localhost%s/admin", normalizeListenForLog(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)

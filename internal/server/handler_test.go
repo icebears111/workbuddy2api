@@ -292,3 +292,130 @@ func TestRetiredProtocolsGone(t *testing.T) {
 		}
 	}
 }
+
+// newProtoHandler 构造一个「非 OpenAI 协议已放开」的 handler，
+// 用于验证开关打开后端点真的能干活（而不只是不返回 410）。
+func newProtoHandler(t *testing.T) *Handler {
+	t.Helper()
+	up := upstream.NewWithBase(fakeUpstream(t, "ok").URL)
+	p := pool.New("") // 不落盘
+	p.Add(&cred.Cred{UID: "acct-1", Nickname: "acct-1", Token: "ck_test", Kind: cred.KindAPIKey})
+	return NewHandler(Config{
+		Pool:                    p,
+		Upstream:                up,
+		APIKey:                  "sk-1",
+		MaxRotate:               3,
+		SoftCooldown:            50 * time.Millisecond,
+		HardCooldown:            50 * time.Millisecond,
+		ErrCooldown:             50 * time.Millisecond,
+		ErrThreshold:            5,
+		EnableAnthropicProtocol: true,
+		EnableResponsesProtocol: true,
+	})
+}
+
+// TestProtocolsEnabledByConfig 锁定「开关打开后端点真正可用」：
+// 配置里显式打开 EnableAnthropicProtocol / EnableResponsesProtocol 时，
+// 三个端点必须注册真实 handler，不再 410 Gone，且返回对应协议的合法结构。
+//
+// 与 TestRetiredProtocolsGone（默认关闭 → 410）配对，两者一起保证
+// 「默认只提供 OpenAI Chat、按需放开」这一行为不会被后续改动破坏。
+func TestProtocolsEnabledByConfig(t *testing.T) {
+	h := newProtoHandler(t)
+
+	// 非流式：应得到 Anthropic message 对象。
+	w := do(t, h, "POST", "/v1/messages", "sk-1",
+		`{"model":"glm-5.2","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/messages: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var msg map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &msg); err != nil {
+		t.Fatalf("decode message: %v", err)
+	}
+	if msg["type"] != "message" {
+		t.Fatalf("type = %v, want message", msg["type"])
+	}
+	if id, _ := msg["id"].(string); !strings.HasPrefix(id, "msg_") {
+		t.Fatalf("id = %q, want msg_ prefix", id)
+	}
+	blocks, _ := msg["content"].([]any)
+	if len(blocks) == 0 {
+		t.Fatalf("content empty: %s", w.Body.String())
+	}
+	if first, _ := blocks[0].(map[string]any); first["type"] != "text" || first["text"] != "你好" {
+		t.Fatalf("first block = %v, want text 你好", first)
+	}
+	if msg["stop_reason"] != "end_turn" {
+		t.Fatalf("stop_reason = %v, want end_turn", msg["stop_reason"])
+	}
+
+	// 流式：必须是 Anthropic 事件序列，而不是 OpenAI 的 data: 帧。
+	w = do(t, h, "POST", "/v1/messages", "sk-1",
+		`{"model":"glm-5.2","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/messages stream: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+	for _, ev := range []string{
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: message_delta",
+		"event: message_stop",
+	} {
+		if !strings.Contains(w.Body.String(), ev) {
+			t.Fatalf("stream missing %q:\n%s", ev, w.Body.String())
+		}
+	}
+
+	// count_tokens：给出正数估算值。
+	w = do(t, h, "POST", "/v1/messages/count_tokens", "sk-1",
+		`{"model":"glm-5.2","messages":[{"role":"user","content":"你好世界"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/messages/count_tokens: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var cnt map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &cnt); err != nil {
+		t.Fatalf("decode count_tokens: %v", err)
+	}
+	if n, _ := cnt["input_tokens"].(float64); n <= 0 {
+		t.Fatalf("input_tokens = %v, want > 0", cnt["input_tokens"])
+	}
+
+	// /v1/responses：不再 410，且能正常返回。
+	w = do(t, h, "POST", "/v1/responses", "sk-1", `{"model":"glm-5.2","input":"hi"}`)
+	if w.Code == http.StatusGone {
+		t.Fatalf("/v1/responses still 410 after enabling: %s", w.Body.String())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/responses: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	// 放开协议不改变鉴权顺序：未带 key 仍 401。
+	if w := do(t, h, "POST", "/v1/messages", "", `{}`); w.Code != http.StatusUnauthorized {
+		t.Fatalf("no key: got %d, want 401", w.Code)
+	}
+}
+
+// TestProtocolFlagsAreIndependent 锁定两个开关互不牵连：
+// 只开 Anthropic 时，/v1/responses 必须仍然 410。
+func TestProtocolFlagsAreIndependent(t *testing.T) {
+	up := upstream.NewWithBase(fakeUpstream(t, "ok").URL)
+	p := pool.New("")
+	p.Add(&cred.Cred{UID: "acct-1", Nickname: "acct-1", Token: "ck_test", Kind: cred.KindAPIKey})
+	h := NewHandler(Config{
+		Pool:                    p,
+		Upstream:                up,
+		APIKey:                  "sk-1",
+		EnableAnthropicProtocol: true,
+		// EnableResponsesProtocol 保持默认 false
+	})
+
+	if w := do(t, h, "POST", "/v1/messages", "sk-1",
+		`{"model":"glm-5.2","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("/v1/messages: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if w := do(t, h, "POST", "/v1/responses", "sk-1", `{"model":"glm-5.2","input":"hi"}`); w.Code != http.StatusGone {
+		t.Fatalf("/v1/responses: got %d, want 410 (flag off)", w.Code)
+	}
+}

@@ -22,6 +22,17 @@
     "err_cooldown": "10m"
   },
 
+  "features": {
+    "desensitize": true,
+    "desensitize_tools": true,
+    "strip_tool_metadata": false,
+    "hide_reasoning": true,
+    "min_reasoning_effort": "",
+
+    "enable_anthropic_protocol": false,
+    "enable_responses_protocol": false
+  },
+
   "schedule": {
     "check_hours": [0, 6, 12, 18]
   }

@@ -126,7 +126,11 @@ curl http://localhost:7865/v1/chat/completions \
     "desensitize_tools": true,        // 对 tools 的 description/title 做脱敏
     "strip_tool_metadata": false,     // true = 直接删 description/title（过审率高但模型看不到说明）
     "hide_reasoning": false,          // true = 流式剥离 reasoning_content
-    "min_reasoning_effort": ""        // 思考深度下限 low/medium/high/max；留空 = 透传
+    "min_reasoning_effort": "",       // 思考深度下限 low/medium/high/max；留空 = 透传
+
+    // 非 OpenAI 协议开关，默认 false = 返回 410 Gone（见「客户端接入」）
+    "enable_anthropic_protocol": false,  // true = 开放 /v1/messages（Claude Code 可直连）
+    "enable_responses_protocol": false   // true = 开放 /v1/responses（Codex CLI 可直连）
   },
 
   "schedule": {
@@ -140,21 +144,22 @@ curl http://localhost:7865/v1/chat/completions \
 
 > 说明：上例 `features.hide_reasoning` 显式设为 **false**，是为了**保留 `reasoning_content`** 便于直连观测 / 调试。若 `features` 段整体缺省，则走代码内置默认，此时 `hide_reasoning=true`（更贴近标准 OpenAI 流）。实际行为以你 config.json 里写的值为准，本文档仅作说明，不改动任何默认值。
 
-### 环境变量覆盖（前缀 `WB2A_`）
+### 环境变量覆盖（前缀 `CB2A_`）
 
-下列配置项支持同名环境变量覆盖（`WB2A_` + 大写下划线），优先级高于 config.json；未列出的项（如 `usage_file`、`quota_limit`、`schedule.check_hours`）仅能通过 config.json 配置：
+下列配置项支持同名环境变量覆盖（`CB2A_` + 大写下划线），优先级高于 config.json；未列出的项（如 `usage_file`、`quota_limit`、`schedule.check_hours`）仅能通过 config.json 配置：
 
-`WB2A_LISTEN` / `WB2A_API_KEY` / `WB2A_AUTH_DIR` / `WB2A_FALLBACK_MODEL` / `WB2A_STATE_FILE`
-`WB2A_UPSTREAM_BASE` / `WB2A_UPSTREAM_ENV` / `WB2A_OAUTH_TOKEN_URL` / `WB2A_OAUTH_CLIENT_ID`
-`WB2A_HARD_CREDIT` / `WB2A_SOFT_RATE` / `WB2A_ERR_THRESHOLD` / `WB2A_ERR_COOLDOWN` / `WB2A_TIMEOUT_SECONDS`
-`WB2A_AUTO_CHECKIN` / `WB2A_CHECKIN_START_HOUR` / `WB2A_CHECKIN_END_HOUR`
-`WB2A_DESENSITIZE` / `WB2A_DESENSITIZE_TOOLS` / `WB2A_STRIP_TOOL_METADATA` / `WB2A_HIDE_REASONING` / `WB2A_MIN_REASONING_EFFORT`
+`CB2A_LISTEN` / `CB2A_API_KEY` / `CB2A_AUTH_DIR` / `CB2A_FALLBACK_MODEL` / `CB2A_STATE_FILE`
+`CB2A_UPSTREAM_BASE` / `CB2A_UPSTREAM_ENV` / `CB2A_OAUTH_TOKEN_URL` / `CB2A_OAUTH_CLIENT_ID`
+`CB2A_HARD_CREDIT` / `CB2A_SOFT_RATE` / `CB2A_ERR_THRESHOLD` / `CB2A_ERR_COOLDOWN` / `CB2A_TIMEOUT_SECONDS`
+`CB2A_AUTO_CHECKIN` / `CB2A_CHECKIN_START_HOUR` / `CB2A_CHECKIN_END_HOUR`
+`CB2A_DESENSITIZE` / `CB2A_DESENSITIZE_TOOLS` / `CB2A_STRIP_TOOL_METADATA` / `CB2A_HIDE_REASONING` / `CB2A_MIN_REASONING_EFFORT`
+`CB2A_ENABLE_ANTHROPIC_PROTOCOL` / `CB2A_ENABLE_RESPONSES_PROTOCOL`
 
 ---
 
 ## 客户端接入
 
-本网关**只对外提供 OpenAI Chat**，仅两个端点：
+本网关**默认只对外提供 OpenAI Chat**，仅两个端点：
 
 - `POST /v1/chat/completions`
 - `GET /v1/models`
@@ -164,9 +169,47 @@ curl http://localhost:7865/v1/chat/completions \
 | 客户端 | 端点 | 协议 |
 |---|---|---|
 | Cherry Studio / LobeChat / NextChat / Open WebUI 等 | `/v1/chat/completions` | OpenAI Chat，直连 |
-| Claude Code / Codex CLI | 不可直连 | 需先经转换层 |
+| Claude Code / Claude Desktop | `/v1/messages` | Anthropic Messages，需打开开关 |
+| Codex CLI | `/v1/responses` | OpenAI Responses，需打开开关 |
 
-> ⚠️ `/v1/messages`、`/v1/messages/count_tokens`、`/v1/responses`（Anthropic / Responses 协议）**已下线**，请求返回 **HTTP 410** 并提示改用转换代理。**Claude Code 不能直连本网关**：请先在中间套一层转换层（如 CC Switch / claude-code-router / LiteLLM），把 Anthropic / Responses 转成 OpenAI chat，再让转换层把 Base URL 指向本网关的 `http://<host>:7865/v1`。
+> ⚠️ 默认状态下 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/responses`（Anthropic / Responses 协议）**已下线**，请求返回 **HTTP 410** 并提示改用转换代理。此时 **Claude Code 不能直连本网关**：请先在中间套一层转换层（如 CC Switch / claude-code-router / LiteLLM），把 Anthropic / Responses 转成 OpenAI chat，再让转换层把 Base URL 指向本网关的 `http://<host>:7865/v1`。
+
+### 可选：直接开放 Anthropic / Responses 协议（免转换层）
+
+不想再套转换层时，在 `config.json` 的 `features` 段打开对应开关即可（默认 `false`）：
+
+```json
+{ "features": { "enable_anthropic_protocol": true, "enable_responses_protocol": false } }
+```
+
+也支持环境变量 `CB2A_ENABLE_ANTHROPIC_PROTOCOL` / `CB2A_ENABLE_RESPONSES_PROTOCOL`（`true` 或 `1`）。两个开关**互相独立**，可只开其一。
+
+打开后 Claude Code 可**直连本网关**，不需要任何中间进程：
+
+```powershell
+$env:ANTHROPIC_BASE_URL   = 'http://127.0.0.1:7865'   # 注意：不带 /v1
+$env:ANTHROPIC_AUTH_TOKEN = '<你的网关api_key>'
+claude
+```
+
+> **为什么这比转换层更适合「多实例分流」**：转换层（CC Switch）对同一个 app 类型只暴露**一个**本地端口，因此两个终端没法同时指向两个网关；而协议做进网关之后，**每个终端只要在启动时指定自己的实例就锁死一个**，两个实例各用各的 `auths/`，账号池天然互不重复。
+>
+> **注意用 `--settings` 而非环境变量**：`~/.claude/settings.json` 里 `env` 段的优先级
+> **高于进程环境变量**（Claude Code 自身设定），若该文件已被转换层写入
+> `ANTHROPIC_BASE_URL`，`$env:` 会被覆盖回去。命令行参数优先级更高：
+>
+> ```powershell
+> claude --settings .\profiles\instance-a.json   # 指向实例 A
+> claude --settings .\profiles\instance-b.json   # 指向实例 B
+> ```
+>
+> 两个 profile 内容形如 `{"env":{"ANTHROPIC_BASE_URL":"http://<host>:7865","ANTHROPIC_AUTH_TOKEN":"<该实例的 api_key>"}}`。
+> **恢复历史对话时也要带上 `--settings`**（`claude --settings <file> -c`）：
+> 会话文件存在本机、两个实例共享，但请求去向由启动参数决定，漏了会走转换层。
+>
+> 另需注意模型映射：客户端若不发上游认识的模型名（如 Claude Code 发 `claude-opus-5`），
+> 网关会按 `fallback_model` 回落；profile 里建议显式指定
+> `ANTHROPIC_MODEL` 等变量，避免落到能力较弱的兜底模型上。
 
 ---
 
@@ -179,11 +222,21 @@ curl http://localhost:7865/v1/chat/completions \
 - **自动授权登录** — 中国版（cn） / 国际版（saas）OAuth 浏览器一键绑号；两域账号分开管理。
 - **一键签到** — 右上「☑ 一键签到」，对池内所有 OAuth 登录账号逐个执行官方每日签到。
 - **模型 / 对话测试** — 模型标签 + 流式 / 非流式对话测试（支持指定账号或自动轮询）。
-- **客户端接入** — 一键复制 Base URL / API Key，并提示 Claude Code 需先转 chat。
+- **客户端接入** — 一键复制 Base URL / API Key；接入指引会**跟随运行时配置**提示 Claude Code / Codex CLI 是「可直连」还是「需转换层」。
 
 ### 自动调度说明
 
 配置 `schedule.auto_checkin: true`（默认开启）后，服务会在每天 **08:00–10:00（本地时区）窗口内的随机时刻** 自动签到：各账号分配**互不相同的随机时刻**、逐个错开执行，避免整点齐发。每账号当天「已签 / 未签」状态持久化在 `data/checkin_state.json`，后台逐账号展示。
+
+> **签到域名按凭证域自动选择**：签到接口的两侧边缘（APISIX）各自只认本域签发的 token，用错域会拿到 **401 + HTML 错误页**（不是业务 JSON）。因此
+> `realm=cn`（copilot.tencent.com 登录）→ `www.workbuddy.cn`，
+> `realm=saas`（www.codebuddy.ai 登录）→ `www.codebuddy.ai`。
+> 实测同一枚 saas token：打 codebuddy.ai 返回 200，打 workbuddy.cn 返回 `401 invalid_token`。
+> 另：401/403 一律判为「凭证被拒绝，需重新登录」并**自动停用该账号**（不再受响应体是否为 JSON 影响）。
+>
+> **`code==10001` 在两个域语义不同**，不能只看 code：CN 域是「今天已签到，请明天再来」（幂等命中，算已签），
+> SaaS 域是「签到活动未开启或已过期」（**并未签到**）。后者按未签处理，否则后台会把从未签到的 saas 号显示成「已签」。
+> 实测 saas 域当前没有可用的签到活动，因此 saas 账号只走转发、拿不到签到积分——这是上游侧的现状，不是网关故障。
 
 配套的保活机制：按 `schedule.check_hours`（默认 `[0, 6, 12, 18]`，即每天 0 / 6 / 12 / 18 点）整点对账号探活；凭证失效（401/403）自动禁用；token 到期（`ExpiresAt`）也会被自动禁用并在后台提示**重新登录**。
 
@@ -201,8 +254,8 @@ internal/checkin/      每日签到（官方接口），当天状态持久化
 internal/cred/         凭证加载 / 保存 / 续期
 internal/pool/         账号池 + 冷却状态机 + data/state.json
 internal/scheduler/    保活探活 + 到期自动禁用 + 每日自动签到（随机错开）
-internal/server/       OpenAI Chat 路由 + 管理 API + 后台页面（admin.html, go:embed）
-internal/upstream/     上游客户端 + 错误分类 + 模型 + 脱敏 + 协议转换（已下线，见下）
+internal/server/       路由（OpenAI Chat + 可选 Anthropic / Responses）+ 管理 API + 后台页面（admin.html, go:embed）
+internal/upstream/     上游客户端 + 错误分类 + 模型 + 脱敏 + 协议转换（Anthropic / Responses）
 internal/usage/        本地用量累计 + quota 看门狗
 auths/                 凭证目录（.gitignore，不入库）
 data/                  运行时状态（state/usage/checkin_state，.gitignore）
@@ -245,7 +298,7 @@ cd /opt/codebuddy2api
 ```bash
 go build ./...          # 编译全部
 go test ./...           # 运行单元 / 协议 / 池测试
-go run ./cmd/check -key ck_xxx   # 探测某个 Key 可用性与可见模型（或设环境变量 WB2A_KEY）
+go run ./cmd/check -key ck_xxx   # 探测某个 Key 可用性与可见模型（或设环境变量 CB2A_KEY）
 ```
 
 - 代码无第三方运行时依赖（标准库实现），测试覆盖池状态机、协议转换、错误分类等核心逻辑。

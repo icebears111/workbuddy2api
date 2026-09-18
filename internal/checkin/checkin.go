@@ -1,9 +1,17 @@
 // Package checkin —— CodeBuddy 每日签到（官方接口）。
 // 仅 OAuth 登录型（KindToken）账号可签；ck_ 静态 API Key 会被官方拒绝（403），标记 Skipped。
-//   POST https://www.workbuddy.cn/billing/meter/daily-checkin
-//   Authorization: Bearer <登录 token>
-//   code==0 → 签到成功（data.credit / data.streak_days）
-//   code==10001 → 今天已签到（幂等）
+//
+//	POST <按 realm 选择签到域名>
+//	Authorization: Bearer <登录 token>
+//	code==0 → 签到成功（data.credit / data.streak_days）
+//	code==10001 → 今天已签到（幂等）
+//
+// 签到域名必须与凭证的 realm 对应，两者边缘（APISIX）各自只认自己域的 token：
+//   - CN 域（copilot.tencent.com 登录的 token）→ www.workbuddy.cn
+//   - SaaS 域（www.codebuddy.ai 登录的 token）→ www.codebuddy.ai
+//
+// 用错域的表现是「边缘 401 + HTML 页面」（不是业务 JSON），见 doOne 里的说明。
+//
 // 服务器与调度器共用本包，避免两套签到逻辑。
 package checkin
 
@@ -14,14 +22,33 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"codebuddy2api/internal/cred"
 )
 
-// Endpoint 官方每日签到接口。
+// Endpoint 官方每日签到接口（CN 域 / copilot realm 凭证）。
 const Endpoint = "https://www.workbuddy.cn/billing/meter/daily-checkin"
+
+// saasEndpoint SaaS 域（www.codebuddy.ai 登录所得 OAuth token）的签到接口。
+//
+// 实测（2026-09）：同一枚 saas token 打两个域的结果完全不同——
+//   - POST https://www.codebuddy.ai/v2/billing/meter/get-payment-type → 200
+//   - POST https://www.workbuddy.cn/billing/meter/get-user-resource    → 401
+//
+// 且 www.workbuddy.cn 的边缘对任意路径都先鉴权后路由（不存在路径也回 401），
+// 说明它只认 CN 域的 token；saas token 在那里必然被拒。
+const saasEndpoint = "https://www.codebuddy.ai/v2/billing/meter/daily-checkin"
+
+// endpointForRealm 按凭证所属域选择签到域名。未知/空 realm 走 CN 域（历史行为）。
+func endpointForRealm(realm string) string {
+	if realm == "saas" {
+		return saasEndpoint
+	}
+	return Endpoint
+}
 
 // Item 单账号签到结果。
 type Item struct {
@@ -61,7 +88,7 @@ func All(authDir string, skipDisabled map[string]bool) ([]Item, error) {
 		if skipDisabled != nil && skipDisabled[c.UID] {
 			continue
 		}
-		it := doOne(c.Token)
+		it := doOne(c.Token, c.Realm)
 		it.UID = c.UID
 		it.Nickname = c.Nickname
 		it.Realm = c.Realm
@@ -81,7 +108,7 @@ func One(authDir, uid string) (Item, bool) {
 		if c == nil || c.UID != uid || c.Kind != cred.KindToken || c.Token == "" {
 			continue
 		}
-		it := doOne(c.Token)
+		it := doOne(c.Token, c.Realm)
 		it.UID = c.UID
 		it.Nickname = c.Nickname
 		it.Realm = c.Realm
@@ -89,6 +116,31 @@ func One(authDir, uid string) (Item, bool) {
 		return it, true
 	}
 	return Item{}, false
+}
+
+// AlreadySigned 报告上游是否表示「今天已签到」（幂等命中），
+// 供调用方决定要不要把当天状态落成「已签」。
+//
+// 注意：code==10001 在不同域语义不同，**不能只看 code**：
+//   - CN 域（www.workbuddy.cn）  ：10001 = 「今天已签到，请明天再来」→ 确属已签
+//   - SaaS 域（www.codebuddy.ai）：10001 = 「签到活动未开启或已过期」→ 根本没签
+//
+// 实测（2026-09）：三个 saas 号全部返回 10001 + 未开启/已过期，
+// 旧逻辑据此把「从未签到」的账号记成「已签」，后台角标因此长期失真。
+// 这里用否定语义关键词排除掉「活动不可用」的情形。
+func (it Item) AlreadySigned() bool {
+	if it.OK {
+		return true
+	}
+	if it.Code != 10001 {
+		return false
+	}
+	for _, m := range []string{"未开启", "未开始", "已过期", "已结束"} {
+		if strings.Contains(it.Msg, m) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------- 当天签到状态（持久化到 <authDir>/../data/checkin_state.json） ----------
@@ -172,8 +224,13 @@ func Today(authDir string) (string, map[string]AccountState) {
 	return st.Date, st.Accounts
 }
 
-func doOne(token string) Item {
-	req, err := http.NewRequest(http.MethodPost, Endpoint, bytes.NewReader([]byte("{}")))
+func doOne(token, realm string) Item {
+	return doOneAt(endpointForRealm(realm), token)
+}
+
+// doOneAt 对指定签到端点执行一次签到（拆出来便于用 httptest 覆盖边缘返回 HTML 的场景）。
+func doOneAt(endpoint, token string) Item {
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return Item{Msg: "构造请求失败: " + err.Error()}
 	}
@@ -189,6 +246,24 @@ func doOne(token string) Item {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
+	// 401/403 必须先于 JSON 解析判定为「凭证失效」。
+	//
+	// 上游边缘（APISIX）在 token 不被接受时返回的是 HTML 错误页而非业务 JSON：
+	//
+	//	HTTP/1.1 401 Authorization Required
+	//	WWW-Authenticate: Bearer realm="copilot", error="invalid_token"
+	//	Server: APISIX/3.9.1
+	//
+	// 旧逻辑先 json.Unmarshal：解析 HTML 失败即提前 return，AuthDead 没被置位，
+	// 于是 ① 报错退化成「解析响应失败(...)」这种指错方向的文案；
+	// ② 调度器 signOne 拿不到 AuthDead，失效账号不会被自动停用，只会每天重复失败。
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return Item{
+			AuthDead: true,
+			Msg:      "凭证被拒绝(HTTP " + resp.Status + ")，需重新登录",
+		}
+	}
+
 	var payload struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -198,15 +273,12 @@ func doOne(token string) Item {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return Item{Msg: "解析响应失败(HTTP " + resp.Status + "): " + string(body)}
+		return Item{Msg: "解析响应失败(HTTP " + resp.Status + "): " + truncate(string(body), 200)}
 	}
 	out := Item{Code: payload.Code, Credit: payload.Data.Credit, StreakDays: payload.Data.StreakDays}
 	switch {
 	case resp.StatusCode == http.StatusOK && payload.Code == 0:
 		out.OK = true
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		out.AuthDead = true
-		out.Msg = "凭证被拒绝(HTTP " + resp.Status + ")，需重新登录"
 	default:
 		if payload.Msg != "" {
 			out.Msg = payload.Msg
@@ -215,4 +287,12 @@ func doOne(token string) Item {
 		}
 	}
 	return out
+}
+
+// truncate 限长，避免把整页 HTML 塞进后台的报错单元格。
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }

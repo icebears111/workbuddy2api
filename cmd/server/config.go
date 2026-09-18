@@ -60,6 +60,19 @@ type Config struct {
 		// 时发 low（上游直接关闭思考）。设置后低于下限的档位抬到下限、缺省补下限；
 		// 留空保持客户端原值透传。
 		MinReasoningEffort string `json:"min_reasoning_effort"`
+
+		// EnableAnthropicProtocol 重新开放 POST /v1/messages 与
+		// POST /v1/messages/count_tokens（Anthropic Messages 协议）。
+		//
+		// 默认 false：保持 README「本网关只对外提供 OpenAI Chat」的对外契约，
+		// 三个非 OpenAI 端点一律 410 Gone + 迁移指引。
+		// 置 true 后 Claude Code / Claude Desktop 可**直连本网关**，不再需要
+		// CC Switch / ccr / LiteLLM 之类的中间转换层 —— 这样「两个终端各指一个
+		// 网关实例」就能把账号池彻底隔离开（见 docs/deploy-nas.md 第五节）。
+		EnableAnthropicProtocol bool `json:"enable_anthropic_protocol"`
+		// EnableResponsesProtocol 重新开放 POST /v1/responses（OpenAI Responses
+		// 协议，Codex CLI 用）。默认 false，理由同上。
+		EnableResponsesProtocol bool `json:"enable_responses_protocol"`
 	} `json:"features"`
 
 	Schedule struct {
@@ -182,6 +195,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CB2A_MIN_REASONING_EFFORT"); v != "" {
 		c.Features.MinReasoningEffort = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("CB2A_ENABLE_ANTHROPIC_PROTOCOL"); v != "" {
+		c.Features.EnableAnthropicProtocol = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("CB2A_ENABLE_RESPONSES_PROTOCOL"); v != "" {
+		c.Features.EnableResponsesProtocol = strings.EqualFold(v, "true") || v == "1"
 	}
 	if v := os.Getenv("CB2A_AUTO_CHECKIN"); v != "" {
 		c.Schedule.AutoCheckin = strings.EqualFold(v, "true") || v == "1"

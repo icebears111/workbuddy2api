@@ -55,6 +55,15 @@ type Config struct {
 	ClientID      string
 	Tracker       *usage.Tracker
 
+	// EnableAnthropicProtocol 开放 POST /v1/messages 与
+	// POST /v1/messages/count_tokens（Anthropic Messages 协议），
+	// 使 Claude Code / Claude Desktop 可直连本网关。
+	// 为 false（默认）时这两个端点返回 410 Gone，保持「只提供 OpenAI Chat」契约。
+	EnableAnthropicProtocol bool
+	// EnableResponsesProtocol 开放 POST /v1/responses（OpenAI Responses 协议，
+	// Codex CLI 用）。为 false（默认）时返回 410 Gone。
+	EnableResponsesProtocol bool
+
 	// Realms 各账号域的上游配置；key 为 Cred.Realm（"" 与 "cn" 走默认上游）。
 	Realms map[string]RealmConfig
 }
@@ -164,14 +173,28 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/chat/completions", requireAPIKey(cfg.APIKey, h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", requireAPIKey(cfg.APIKey, h.listModels))
 
-	// 已下线的协议端点：返回 410 Gone + 迁移提示（而不是 404，
-	// 避免客户端误以为路径写错而反复重试）。Claude Code / Codex CLI 不能直连
-	// 本网关，需先经转换层（CC Switch / claude-code-router / LiteLLM）转成
-	// OpenAI Chat。转换实现（upstream/anthropic.go、responses.go）保留在代码里，
-	// 供测试与将来恢复使用。
-	h.mux.HandleFunc("POST /v1/responses", requireAPIKey(cfg.APIKey, h.retiredProtocol("Responses 协议（Codex CLI）")))
-	h.mux.HandleFunc("POST /v1/messages", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
+	// 非 OpenAI 协议端点：默认下线，返回 410 Gone + 迁移提示（而不是 404，
+	// 避免客户端误以为路径写错而反复重试）。默认状态下 Claude Code / Codex CLI
+	// 不能直连本网关，需先经转换层（CC Switch / claude-code-router / LiteLLM）
+	// 转成 OpenAI Chat。
+	//
+	// 若配置里显式打开 EnableAnthropicProtocol / EnableResponsesProtocol，
+	// 则改注册真实 handler —— 转换实现（upstream/anthropic.go、responses.go）
+	// 一直在代码里维护，开关只是决定要不要对外暴露。
+	// 典型用法：两个网关实例各开各的开关，客户端用「两个终端各指一个实例」的
+	// 方式把账号池彻底隔离开（见 docs/deploy-nas.md 第五节）。
+	if cfg.EnableResponsesProtocol {
+		h.mux.HandleFunc("POST /v1/responses", requireAPIKey(cfg.APIKey, h.responsesAPI))
+	} else {
+		h.mux.HandleFunc("POST /v1/responses", requireAPIKey(cfg.APIKey, h.retiredProtocol("Responses 协议（Codex CLI）")))
+	}
+	if cfg.EnableAnthropicProtocol {
+		h.mux.HandleFunc("POST /v1/messages", requireAPIKey(cfg.APIKey, h.anthropicMessages))
+		h.mux.HandleFunc("POST /v1/messages/count_tokens", requireAPIKey(cfg.APIKey, h.anthropicCountTokens))
+	} else {
+		h.mux.HandleFunc("POST /v1/messages", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
+		h.mux.HandleFunc("POST /v1/messages/count_tokens", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
+	}
 
 	// 健康检查（不认证，给容器 healthcheck 用）
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -563,6 +586,14 @@ func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID str
 			err = nil
 		}
 		if err != nil {
+			// 客户端主动断开（Claude Code 流式空闲超时、用户 Ctrl-C、连接被掐）：
+			// 这是调用方侧行为，不是账号问题。必须在这里短路，否则一次客户端超时
+			// 就会走下面的 NoteError 累计，5 次之后把唯一可用账号打进 10 分钟冷却
+			// ——表现为「客户端一超时，整个账号池就集体不可用」。
+			if ctx.Err() != nil {
+				log.Printf("forward: client canceled, skip account penalty uid=%s: %v", acct.UID, ctx.Err())
+				return nil, nil, http.StatusRequestTimeout, fmt.Errorf("client canceled: %w", ctx.Err())
+			}
 			var ue *upstream.Error
 			if errors.As(err, &ue) {
 				lastStatus = statusForKind(ue.Kind, ue.Status)
@@ -626,6 +657,9 @@ func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID str
 	if lastStatus == 0 {
 		lastStatus = http.StatusServiceUnavailable
 	}
+	// 必须留痕：三套协议共用本函数，而调用方（尤其 Anthropic 路径）此前不打任何
+	// 日志，导致「客户端只看到重试、日志里一片安静」这种最难查的故障形态。
+	log.Printf("forward: giving up tried=%d status=%d err=%v", len(tried), lastStatus, lastErr)
 	return nil, nil, lastStatus, errors.New(msg)
 }
 
@@ -935,6 +969,8 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"))
 	if ferr != nil {
+		log.Printf("messages: forward failed status=%d model=%s msgs=%d tools=%d err=%v",
+			status, model, nMsgs, nTools, ferr)
 		writeAnthropicError(w, status, "api_error", ferr.Error())
 		return
 	}
@@ -1476,6 +1512,10 @@ func (h *Handler) apiStatus(w http.ResponseWriter, r *http.Request) {
 		"has_api_key":   h.cfg.APIKey != "",
 		"upstream_base": h.cfg.Upstream.Base,
 		"auth_dir":      h.cfg.AuthDir,
+		// 非 OpenAI 协议是否放开：管理页据此渲染正确的接入指引，
+		// 避免「页面说不能直连、实际能连」或反过来的前后矛盾。
+		"anthropic_protocol": h.cfg.EnableAnthropicProtocol,
+		"responses_protocol": h.cfg.EnableResponsesProtocol,
 	})
 }
 
