@@ -53,3 +53,26 @@ func requireAPIKey(apiKey string, store *apikey.Store, next http.HandlerFunc) ht
 			"missing or invalid API key")
 	}
 }
+
+// requireGlobalKey 只认全局 key —— 用于**管理接口**。
+//
+// 为什么管理接口不能接受多 key 表里的 key：那些 key 是发给调用方「用模型」的，
+// 若它们也能过管理鉴权，任何一把被泄漏/外传的调用方 key 就能：
+//   · 列出全部凭证（脱敏，但仍是信息面）；
+//   · **给自己签发新 key**（无限提权）；
+//   · 删掉别人的 key（拒绝服务）。
+// 所以管理面只认全局 key —— 那把只存在于服务器与运维手里。
+func requireGlobalKey(apiKey string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if apiKey == "" { // 未配置 = 内网自用模式
+			next(w, r)
+			return
+		}
+		if extractKey(r) != apiKey {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key",
+				"missing or invalid API key")
+			return
+		}
+		next(w, r)
+	}
+}

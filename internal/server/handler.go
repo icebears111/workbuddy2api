@@ -180,33 +180,37 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 
 	// 管理 API
-	h.mux.HandleFunc("GET /api/status", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiStatus))
-	h.mux.HandleFunc("GET /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAccounts))
-	h.mux.HandleFunc("POST /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAddAccount))
-	h.mux.HandleFunc("POST /api/accounts/test", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiTestAccount))
-	h.mux.HandleFunc("POST /api/accounts/retest", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRetest))
-	h.mux.HandleFunc("POST /api/accounts/reload", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiReload))
-	h.mux.HandleFunc("GET /api/auth/start", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAuthStart))
-	h.mux.HandleFunc("POST /api/auth/poll", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAuthPoll))
-	h.mux.HandleFunc("POST /api/accounts/enable", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiEnable))
-	h.mux.HandleFunc("POST /api/accounts/disable", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiDisable))
-	h.mux.HandleFunc("DELETE /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRemove))
-	h.mux.HandleFunc("GET /api/models", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiModels))
-	h.mux.HandleFunc("GET /api/quota", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuota))
-	h.mux.HandleFunc("GET /api/quota/all", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaAll))
-	h.mux.HandleFunc("GET /api/quota/usage", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaUsage))
-	h.mux.HandleFunc("GET /api/usage/records", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiUsageRecords))
-	h.mux.HandleFunc("POST /api/quota/limit", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaLimit))
-	h.mux.HandleFunc("POST /api/checkin", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiCheckin))
-	h.mux.HandleFunc("GET /api/checkin/status", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiCheckinStatus))
+	h.mux.HandleFunc("GET /api/status", requireGlobalKey(cfg.APIKey, h.apiStatus))
+	h.mux.HandleFunc("GET /api/accounts", requireGlobalKey(cfg.APIKey, h.apiAccounts))
+	h.mux.HandleFunc("POST /api/accounts", requireGlobalKey(cfg.APIKey, h.apiAddAccount))
+	h.mux.HandleFunc("POST /api/accounts/test", requireGlobalKey(cfg.APIKey, h.apiTestAccount))
+	h.mux.HandleFunc("POST /api/accounts/retest", requireGlobalKey(cfg.APIKey, h.apiRetest))
+	h.mux.HandleFunc("POST /api/accounts/reload", requireGlobalKey(cfg.APIKey, h.apiReload))
+	h.mux.HandleFunc("GET /api/auth/start", requireGlobalKey(cfg.APIKey, h.apiAuthStart))
+	h.mux.HandleFunc("POST /api/auth/poll", requireGlobalKey(cfg.APIKey, h.apiAuthPoll))
+	h.mux.HandleFunc("POST /api/accounts/enable", requireGlobalKey(cfg.APIKey, h.apiEnable))
+	h.mux.HandleFunc("POST /api/accounts/disable", requireGlobalKey(cfg.APIKey, h.apiDisable))
+	h.mux.HandleFunc("DELETE /api/accounts", requireGlobalKey(cfg.APIKey, h.apiRemove))
+	h.mux.HandleFunc("GET /api/models", requireGlobalKey(cfg.APIKey, h.apiModels))
+	h.mux.HandleFunc("GET /api/quota", requireGlobalKey(cfg.APIKey, h.apiQuota))
+	h.mux.HandleFunc("GET /api/quota/all", requireGlobalKey(cfg.APIKey, h.apiQuotaAll))
+	h.mux.HandleFunc("GET /api/quota/usage", requireGlobalKey(cfg.APIKey, h.apiQuotaUsage))
+	h.mux.HandleFunc("GET /api/usage/records", requireGlobalKey(cfg.APIKey, h.apiUsageRecords))
+	h.mux.HandleFunc("POST /api/quota/limit", requireGlobalKey(cfg.APIKey, h.apiQuotaLimit))
+	h.mux.HandleFunc("POST /api/checkin", requireGlobalKey(cfg.APIKey, h.apiCheckin))
+	h.mux.HandleFunc("GET /api/checkin/status", requireGlobalKey(cfg.APIKey, h.apiCheckinStatus))
 
 	// 多 key 管理：给调用方发放独立凭证（可按人吊销）。
-	// 复用 /admin/api/* 同款鉴权 —— 不引入第二套认证逻辑。
+	//
+	// 守卫是 requireGlobalKey 而**不是** requireAPIKey —— 这里只能由全局 key 进入。
+	// 若放开给调用方 key，任何一把外传的 key 都能给自己签发新 key（无限提权）。
+	// 与其它 /admin/api/* 同款守卫，不引入第二套认证逻辑。
+	//
 	// 注意：route 必须带方法（GET/POST/DELETE）注册，不能只注册路径。
 	// 否则与下面更宽的 "GET /admin/" 冲突，Go 1.22+ 的 ServeMux 直接 panic。
 	if cfg.KeyStore != nil {
 		guard := func(next http.HandlerFunc) http.HandlerFunc {
-			return requireAPIKey(cfg.APIKey, cfg.KeyStore, next)
+			return requireGlobalKey(cfg.APIKey, next)
 		}
 		kh := apikey.NewHandler(cfg.KeyStore)
 		h.mux.HandleFunc("GET /admin/api/keys", guard(kh.List))
