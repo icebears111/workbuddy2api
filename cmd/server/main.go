@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"codebuddy2api/internal/apikey"
 	"codebuddy2api/internal/cred"
 	"codebuddy2api/internal/pool"
 	"codebuddy2api/internal/scheduler"
@@ -40,6 +41,17 @@ func main() {
 	absAuthDir, _ := filepath.Abs(cfg.AuthDir)
 	absStateFile, _ := filepath.Abs(cfg.StateFile)
 	absUsageFile, _ := filepath.Abs(cfg.UsageFile)
+	absKeysFile, _ := filepath.Abs(cfg.KeysFile)
+
+	// 多 key 表。加载失败不让服务起不来 —— 退回只用全局 key，
+	// 否则一个损坏的 json 就能把整个网关拖死。
+	keyStore, err := apikey.NewStore(absKeysFile)
+	if err != nil {
+		log.Printf("warning: load keys %s failed: %v (仅用全局 key)", absKeysFile, err)
+		keyStore = nil
+	} else {
+		log.Printf("loaded %d api key(s) from %s", keyStore.Count(), absKeysFile)
+	}
 
 	// 加载凭证
 	creds, err := cred.LoadDir(absAuthDir)
@@ -122,6 +134,7 @@ func main() {
 		Pool:          p,
 		Upstream:      up,
 		APIKey:        cfg.APIKey,
+		KeyStore:      keyStore,
 		HardCooldown:  cfg.HardCreditDur,
 		SoftCooldown:  cfg.SoftRateDur,
 		ErrThreshold:  cfg.Cooldown.ErrThresh,
