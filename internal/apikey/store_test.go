@@ -19,7 +19,7 @@ func newTestStore(t *testing.T) *Store {
 func TestCreateAndVerify(t *testing.T) {
 	s := newTestStore(t)
 
-	k, err := s.Create("测试 key", "给 a 用")
+	k, err := s.Create("测试 key", "给 a 用", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestCreateAndVerify(t *testing.T) {
 
 func TestVerifyRejectsUnknown(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Create("a", ""); err != nil {
+	if _, err := s.Create("a", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []string{"", "sk-不存在", "not-required", "sk-"} {
@@ -50,12 +50,12 @@ func TestVerifyRejectsUnknown(t *testing.T) {
 
 func TestDeleteRevokesImmediately(t *testing.T) {
 	s := newTestStore(t)
-	k, _ := s.Create("临时", "")
+	k, _ := s.Create("临时", "", "")
 
 	if _, ok := s.Verify(k.Key); !ok {
 		t.Fatal("删除前应该有效")
 	}
-	if err := s.Delete(k.ID); err != nil {
+	if err := s.Delete(k.ID, ""); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, ok := s.Verify(k.Key); ok {
@@ -65,13 +65,13 @@ func TestDeleteRevokesImmediately(t *testing.T) {
 
 func TestDuplicateNameRejected(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Create("重名", ""); err != nil {
+	if _, err := s.Create("重名", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Create("重名", ""); err == nil {
+	if _, err := s.Create("重名", "", ""); err == nil {
 		t.Fatal("同名应该被拒绝")
 	}
-	if _, err := s.Create("  ", ""); err == nil {
+	if _, err := s.Create("  ", "", ""); err == nil {
 		t.Fatal("空名应该被拒绝")
 	}
 }
@@ -82,7 +82,7 @@ func TestPersistenceAcrossReload(t *testing.T) {
 	path := filepath.Join(dir, "keys.json")
 
 	s1, _ := NewStore(path)
-	k, err := s1.Create("持久", "")
+	k, err := s1.Create("持久", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestFilePermissionsAre0600(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys.json")
 	s, _ := NewStore(path)
-	if _, err := s.Create("x", ""); err != nil {
+	if _, err := s.Create("x", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(path)
@@ -126,7 +126,7 @@ func TestPermissionsStay0600OnRerite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys.json")
 	s, _ := NewStore(path)
-	if _, err := s.Create("a", ""); err != nil {
+	if _, err := s.Create("a", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	// 人为放宽权限，模拟"文件已存在且 0644"
@@ -134,7 +134,7 @@ func TestPermissionsStay0600OnRerite(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 再写一次（走 tmp + rename 路径）
-	if _, err := s.Create("b", ""); err != nil {
+	if _, err := s.Create("b", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	fi, _ := os.Stat(path)
@@ -147,7 +147,7 @@ func TestUniqueKeysGenerated(t *testing.T) {
 	s := newTestStore(t)
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {
-		k, err := s.Create(string(rune('a'+i%26))+string(rune('0'+i/26)), "")
+		k, err := s.Create(string(rune('a'+i%26))+string(rune('0'+i/26)), "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -160,7 +160,7 @@ func TestUniqueKeysGenerated(t *testing.T) {
 
 func TestUsedCallbackFires(t *testing.T) {
 	s := newTestStore(t)
-	k, _ := s.Create("cb", "")
+	k, _ := s.Create("cb", "", "")
 	var fired string
 	s.SetUsedCallback(func(id string) { fired = id })
 
@@ -194,11 +194,11 @@ func TestMaskedSecret(t *testing.T) {
 func TestListSortedByCreatedAt(t *testing.T) {
 	s := newTestStore(t)
 	for _, n := range []string{"c", "a", "b"} {
-		if _, err := s.Create(n, ""); err != nil {
+		if _, err := s.Create(n, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	list := s.List()
+	list := s.List("")
 	if len(list) != 3 {
 		t.Fatalf("应有 3 条，实际 %d", len(list))
 	}
@@ -209,7 +209,55 @@ func TestListSortedByCreatedAt(t *testing.T) {
 	}
 	// List 返回副本，改动不该影响内部状态
 	list[0].Name = "被篡改"
-	if s.List()[0].Name == "被篡改" {
+	if s.List("")[0].Name == "被篡改" {
 		t.Fatal("List 应返回副本")
+	}
+}
+
+// ── 多用户归属（2026-09-21）──
+
+func TestOwnerIsolation(t *testing.T) {
+	s, _ := NewStore("")
+
+	alice, err := s.Create("cc", "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.Create("cc", "", "bob") // 同名不同 owner：允许
+	if err != nil {
+		t.Fatalf("same name under different owner should be allowed: %v", err)
+	}
+	if _, err := s.Create("cc", "", "alice"); err == nil {
+		t.Fatal("duplicate name within same owner should fail")
+	}
+
+	// 列表按 owner 隔离
+	if got := s.List("alice"); len(got) != 1 || got[0].Owner != "alice" {
+		t.Fatalf("alice list = %+v", got)
+	}
+	if got := s.List("bob"); len(got) != 1 || got[0].ID != bob.ID {
+		t.Fatalf("bob list = %+v", got)
+	}
+	if got := s.List(""); len(got) != 2 {
+		t.Fatalf("admin list should see all, got %d", len(got))
+	}
+
+	// 删除：跨 owner 不可删（报 not exist，不泄露存在性）
+	if err := s.Delete(alice.ID, "bob"); err == nil {
+		t.Fatal("bob must not delete alice's key")
+	}
+	if err := s.Delete(alice.ID, "alice"); err != nil {
+		t.Fatalf("alice should delete own key: %v", err)
+	}
+	// 管理员（owner=""）可删任意
+	if err := s.Delete(bob.ID, ""); err != nil {
+		t.Fatalf("admin should delete any key: %v", err)
+	}
+
+	// Verify 带回 owner
+	k, _ := s.Create("k2", "", "carol")
+	got, ok := s.Verify(k.Key)
+	if !ok || got.Owner != "carol" {
+		t.Fatalf("verify should return owner, got %+v ok=%v", got, ok)
 	}
 }

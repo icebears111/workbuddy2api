@@ -209,6 +209,17 @@ func NewHandler(cfg Config) *Handler {
 			return requireAPIKey(cfg.APIKey, cfg.KeyStore, next)
 		}
 		kh := apikey.NewHandler(cfg.KeyStore)
+		// 多用户：key 管理按请求身份作用域（管理员看全部；用户只看/管自己的）。
+		kh.OwnerFrom = func(r *http.Request) (string, bool) {
+			id, ok := identFrom(r)
+			if !ok {
+				return "", true // 未经身份中间件（不应发生）→ 按管理员兼容
+			}
+			if id.Admin {
+				return "", true
+			}
+			return id.Owner, false
+		}
 		h.mux.HandleFunc("GET /admin/api/keys", guard(kh.List))
 		h.mux.HandleFunc("POST /admin/api/keys", guard(kh.Create))
 		h.mux.HandleFunc("DELETE /admin/api/keys/", guard(kh.Delete))
@@ -292,11 +303,17 @@ func (h *Handler) apiModels(w http.ResponseWriter, r *http.Request) {
 // apiQuota 拉取指定（或首个健康）账号的上游套餐/额度信息，并合并本地累计消耗。
 func (h *Handler) apiQuota(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("uid")
+	owner := ownerOf(r)
 	var acct *cred.Cred
 	if uid != "" {
+		// 对象级越权校验：非管理员只能查自己的账号
+		if o, exists := h.cfg.Pool.OwnerOf(uid); exists && owner != "" && o != owner {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+			return
+		}
 		acct = h.cfg.Pool.AuthByUID(uid)
 	} else {
-		acct = h.cfg.Pool.Pick()
+		acct = h.cfg.Pool.PickFor(owner)
 	}
 	if acct == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no account available"})
@@ -348,7 +365,7 @@ func (h *Handler) effectiveModels() []upstream.Model {
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
+		acct := h.cfg.Pool.PickAny(tried) // 全局模型列表：任意账号皆可（结果对所有人相同）
 		if acct == nil {
 			break
 		}
@@ -461,7 +478,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"))
+	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"), ownerOf(r))
 	if ferr != nil {
 		code := "upstream_error"
 		if status == http.StatusServiceUnavailable || status == http.StatusBadGateway {
@@ -492,7 +509,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 非流式：上游恒为流式，这里聚合成单个响应；偶发空工具响应自动换号重试
-	resp, acctAgg, statusAgg, ferrAgg := h.aggregateWithRetry(r.Context(), payload, r.URL.Query().Get("uid"), model)
+	resp, acctAgg, statusAgg, ferrAgg := h.aggregateWithRetry(r.Context(), payload, r.URL.Query().Get("uid"), model, ownerOf(r))
 	if ferrAgg != nil {
 		code := "upstream_error"
 		if statusAgg == http.StatusServiceUnavailable || statusAgg == http.StatusBadGateway {
@@ -512,13 +529,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 三套协议（/v1/chat/completions、/v1/messages、/v1/responses）共用这一份
 // token 续期 / 错误分类 / 冷却禁用的逻辑。
 // 失败时 err 非 nil，status 为建议回给客户端的 HTTP 状态码。
-func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID string) (io.ReadCloser, *cred.Cred, int, error) {
-	if h.cfg.Pool.Pick() == nil {
+func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID, owner string) (io.ReadCloser, *cred.Cred, int, error) {
+	if h.cfg.Pool.PickFor(owner) == nil {
 		return nil, nil, http.StatusServiceUnavailable, errors.New("all accounts unavailable (cooling/disabled)")
 	}
 
-	// 指定账号（对话测试页 / 调试用）
+	// 指定账号（对话测试页 / 调试用）。非管理员只能指定自己的账号（对象级越权校验）。
 	if prefUID != "" {
+		if o, exists := h.cfg.Pool.OwnerOf(prefUID); exists && owner != "" && o != owner {
+			return nil, nil, http.StatusNotFound, fmt.Errorf("account not found: %s", prefUID)
+		}
 		acct := h.cfg.Pool.AuthByUID(prefUID)
 		if acct == nil {
 			return nil, nil, http.StatusNotFound, fmt.Errorf("account not found: %s", prefUID)
@@ -553,7 +573,7 @@ func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID str
 	var lastErr error
 	lastStatus := 0
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
+		acct := h.cfg.Pool.PickExcludingFor(owner, tried)
 		if acct == nil {
 			break
 		}
@@ -653,8 +673,8 @@ func (h *Handler) forwardStream(ctx context.Context, payload []byte, prefUID str
 // 这类空响应原样下发时：OpenAI 客户端看到空消息；Anthropic 客户端（Claude Code）
 // 会因 stop_reason=tool_use 而无 tool_use 块报 "The model's tool call could not be parsed"。
 // 换号重试通常能拿到正常响应；重试失败则返回第一次结果兜底（Anthropic 侧另有降级保护）。
-func (h *Handler) aggregateWithRetry(ctx context.Context, payload []byte, prefUID, model string) (map[string]any, *cred.Cred, int, error) {
-	rc, acct, status, ferr := h.forwardStream(ctx, payload, prefUID)
+func (h *Handler) aggregateWithRetry(ctx context.Context, payload []byte, prefUID, model, owner string) (map[string]any, *cred.Cred, int, error) {
+	rc, acct, status, ferr := h.forwardStream(ctx, payload, prefUID, owner)
 	if ferr != nil {
 		return nil, acct, status, ferr
 	}
@@ -668,7 +688,7 @@ func (h *Handler) aggregateWithRetry(ctx context.Context, payload []byte, prefUI
 		return resp, acct, 0, nil
 	}
 	log.Printf("upstream: empty tool response (finish_reason=tool_calls, no content), retrying once with another account")
-	rc2, acct2, _, ferr2 := h.forwardStream(ctx, payload, "")
+	rc2, acct2, _, ferr2 := h.forwardStream(ctx, payload, "", owner)
 	if ferr2 != nil {
 		return resp, acct, 0, nil
 	}
@@ -951,7 +971,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"))
+	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"), ownerOf(r))
 	if ferr != nil {
 		writeAnthropicError(w, status, "api_error", ferr.Error())
 		return
@@ -967,7 +987,7 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, acctAgg, statusAgg, ferrAgg := h.aggregateWithRetry(r.Context(), payload, r.URL.Query().Get("uid"), model)
+	resp, acctAgg, statusAgg, ferrAgg := h.aggregateWithRetry(r.Context(), payload, r.URL.Query().Get("uid"), model, ownerOf(r))
 	if ferrAgg != nil {
 		writeAnthropicError(w, statusAgg, "api_error", ferrAgg.Error())
 		return
@@ -1019,7 +1039,7 @@ func (h *Handler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"))
+	rc, acct, status, ferr := h.forwardStream(r.Context(), payload, r.URL.Query().Get("uid"), ownerOf(r))
 	if ferr != nil {
 		writeOpenAIError(w, status, "api_error", ferr.Error())
 		return
@@ -1127,6 +1147,13 @@ const quotaAllTTL = 45 * time.Second
 // apiQuotaAll 返回全账号额度（带 45s TTL 缓存与 single-flight 合并）。
 // 首次未命中时同步拉取；刷新期间其他请求等待共享结果，避免穿透。
 func (h *Handler) apiQuotaAll(w http.ResponseWriter, r *http.Request) {
+	// 多用户：普通用户的额度视图与管理员不同，不能共用同一份缓存
+	// （否则用户会读到含他人账号的缓存，反之亦然）。
+	if ownerOf(r) != "" {
+		writeCachedJSON(w, h.fetchQuotaAll(r))
+		return
+	}
+
 	h.quotaMu.Lock()
 	if h.quotaAllCache != nil && time.Since(h.quotaAllAt) < quotaAllTTL {
 		data := h.quotaAllCache
@@ -1274,7 +1301,10 @@ func parseCycleEnd(v any) (time.Time, bool) {
 }
 
 func (h *Handler) fetchQuotaAll(r *http.Request) []byte {
-	statuses := h.cfg.Pool.List()
+	statuses := h.cfg.Pool.ListFor(ownerOf(r)) // 多用户：只拉自己账号的额度
+	if isAdminReq(r) {
+		statuses = h.cfg.Pool.ListAll() // 管理员：全部账号
+	}
 	// 并发拉取：上游配额接口单次 ~2.2s，串行会随账号数线性变慢
 	// （2 号 ~5s、4 号 ~10s）。改为每账号一个 goroutine 同时发，
 	// 总耗时 ≈ 最慢的那一个；结果按原顺序写回，保持响应结构不变。
@@ -1397,9 +1427,18 @@ func writeCachedJSON(w http.ResponseWriter, data []byte) {
 }
 
 // apiQuotaUsage 仅返回本地累计消耗快照（不访问上游）。
+// 多用户：非管理员只统计自己名下账号的消耗。
 func (h *Handler) apiQuotaUsage(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Tracker == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "tracker not initialized"})
+		return
+	}
+	if owner := ownerOf(r); owner != "" {
+		keep := map[string]bool{}
+		for _, st := range h.cfg.Pool.ListFor(owner) {
+			keep[st.UID] = true
+		}
+		writeJSON(w, http.StatusOK, h.cfg.Tracker.FilterByAccounts(keep))
 		return
 	}
 	writeJSON(w, http.StatusOK, h.cfg.Tracker.Snapshot())
@@ -1412,13 +1451,22 @@ func (h *Handler) apiUsageRecords(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "tracker not initialized"})
 		return
 	}
-	recs := h.cfg.Tracker.Records()
+	var snap usage.Snapshot
+	if owner := ownerOf(r); owner != "" {
+		keep := map[string]bool{}
+		for _, st := range h.cfg.Pool.ListFor(owner) {
+			keep[st.UID] = true
+		}
+		snap = h.cfg.Tracker.FilterByAccounts(keep)
+	} else {
+		snap = h.cfg.Tracker.Snapshot()
+	}
+	recs := snap.Records
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < len(recs) {
 			recs = recs[:n]
 		}
 	}
-	snap := h.cfg.Tracker.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"records":          recs,
 		"count":            len(recs),
@@ -1433,6 +1481,10 @@ func (h *Handler) apiUsageRecords(w http.ResponseWriter, r *http.Request) {
 
 // apiQuotaLimit 设置额度上限。
 func (h *Handler) apiQuotaLimit(w http.ResponseWriter, r *http.Request) {
+	if !isAdminReq(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "需要管理员权限"})
+		return
+	}
 	if h.cfg.Tracker == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "tracker not initialized"})
 		return
@@ -1485,20 +1537,41 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiStatus 状态总览。多用户：非管理员只看到自己账号的统计；管理员看全部。
 func (h *Handler) apiStatus(w http.ResponseWriter, r *http.Request) {
-	total, healthy := h.cfg.Pool.Count()
+	if isAdminReq(r) {
+		total, healthy := h.cfg.Pool.Count()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accounts":      h.cfg.Pool.ListAll(),
+			"total":         total,
+			"healthy":       healthy,
+			"has_api_key":   h.cfg.APIKey != "",
+			"upstream_base": h.cfg.Upstream.Base,
+			"auth_dir":      h.cfg.AuthDir,
+		})
+		return
+	}
+	owner := ownerOf(r)
+	list := h.cfg.Pool.ListFor(owner)
+	healthy := 0
+	for _, st := range list {
+		if st.Healthy {
+			healthy++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":      h.cfg.Pool.List(),
-		"total":         total,
-		"healthy":       healthy,
-		"has_api_key":   h.cfg.APIKey != "",
-		"upstream_base": h.cfg.Upstream.Base,
-		"auth_dir":      h.cfg.AuthDir,
+		"accounts": list,
+		"total":    len(list),
+		"healthy":  healthy,
 	})
 }
 
 func (h *Handler) apiAccounts(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.List()})
+	if isAdminReq(r) {
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.ListAll()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.ListFor(ownerOf(r))})
 }
 
 func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
@@ -1526,6 +1599,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	c := &cred.Cred{
 		UID:          strings.TrimSpace(req.UID),
 		Nickname:     strings.TrimSpace(req.Nickname),
+		Owner:        ownerOf(r), // 多用户：账号归属调用方（管理员 → 无主共享池）
 		Token:        tok,
 		Kind:         cred.ClassifyKind(tok),
 		RefreshToken: req.Refresh,
@@ -1666,6 +1740,10 @@ func (h *Handler) apiRetest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "uid is required"})
 		return
 	}
+	if !h.ownAccount(r, uid) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+		return
+	}
 	c := h.cfg.Pool.AuthByUID(uid)
 	if c == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
@@ -1736,6 +1814,7 @@ func (h *Handler) apiAuthPoll(w http.ResponseWriter, r *http.Request) {
 	c := &cred.Cred{
 		UID:          uid,
 		Nickname:     uid,
+		Owner:        ownerOf(r), // 多用户：OAuth 接入的账号归属发起者
 		Realm:        realmTag,
 		Token:        tr.AccessToken,
 		Kind:         cred.KindToken,
@@ -1775,6 +1854,10 @@ func (h *Handler) apiAuthPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiReload(w http.ResponseWriter, r *http.Request) {
+	if !isAdminReq(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "需要管理员权限"})
+		return
+	}
 	if h.cfg.OnReload == nil {
 		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "reload not configured"})
 		return
@@ -1796,6 +1879,10 @@ func (h *Handler) apiEnable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "uid is required"})
 		return
 	}
+	if !h.ownAccount(r, uid) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+		return
+	}
 	if !h.cfg.Pool.Enable(uid) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 		return
@@ -1810,7 +1897,7 @@ func (h *Handler) apiDisable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "uid is required"})
 		return
 	}
-	if h.cfg.Pool.AuthByUID(uid) == nil {
+	if h.cfg.Pool.AuthByUID(uid) == nil || !h.ownAccount(r, uid) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 		return
 	}
@@ -1827,6 +1914,10 @@ func (h *Handler) apiRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("uid")
 	if uid == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "uid is required"})
+		return
+	}
+	if _, exists := h.cfg.Pool.OwnerOf(uid); !exists || !h.ownAccount(r, uid) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 		return
 	}
 	if h.cfg.OnRemove != nil {

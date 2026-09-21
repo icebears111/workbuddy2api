@@ -31,6 +31,18 @@ type Handler struct {
 	// 例如 codebuddy2api 可以在新建 key 后立刻写一条日志。
 	OnCreate func(*Key)
 	OnDelete func(string)
+	// OwnerFrom 由调用方注入：从请求解析 (owner, admin)。
+	// owner=="" 且 admin=true → 看/管全部；owner!="" → 只看/管自己的。
+	// nil 时行为等同管理员（兼容既有调用）。
+	OwnerFrom func(r *http.Request) (owner string, admin bool)
+}
+
+// scope 解析当前请求的作用域。
+func (h *Handler) scope(r *http.Request) (owner string, admin bool) {
+	if h.OwnerFrom == nil {
+		return "", true
+	}
+	return h.OwnerFrom(r)
 }
 
 // NewHandler 构造。BasePath 默认 "/admin/api/keys"。
@@ -100,8 +112,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
-func (h *Handler) List(w http.ResponseWriter, _ *http.Request) {
-	keys := h.store.List()
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	owner, admin := h.scope(r)
+	if admin {
+		owner = "" // 管理员看全部
+	}
+	keys := h.store.List(owner)
 	out := make([]dto, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, toDTO(k))
@@ -118,7 +134,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
-	k, err := h.store.Create(req.Name, req.Note)
+	owner, admin := h.scope(r)
+	if admin {
+		owner = "" // 管理员创建的 key 为管理员/通用级
+	}
+	k, err := h.store.Create(req.Name, req.Note, owner)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -144,14 +164,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var found *Key
-	for _, k := range h.store.List() {
-		if k.ID == id {
-			found = k
-			break
-		}
+	owner, admin := h.scope(r)
+	if admin {
+		owner = ""
 	}
-	if found == nil {
+	found, ok := h.store.Get(id, owner)
+	if !ok {
 		writeErr(w, http.StatusNotFound, "key 不存在")
 		return
 	}
@@ -177,7 +195,11 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "缺少 key id")
 		return
 	}
-	if err := h.store.Delete(id); err != nil {
+	owner, admin := h.scope(r)
+	if admin {
+		owner = ""
+	}
+	if err := h.store.Delete(id, owner); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}

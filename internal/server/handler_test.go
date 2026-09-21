@@ -292,3 +292,75 @@ func TestRetiredProtocolsGone(t *testing.T) {
 		}
 	}
 }
+
+// ── 多用户隔离（2026-09-21）──
+
+// doAsUser 以可信身份头（nginx 注入语义）发请求。
+func doAsUser(t *testing.T, h *Handler, method, path, user, role, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, path, nil)
+	} else {
+		r = httptest.NewRequest(method, path, strings.NewReader(body))
+	}
+	r.Header.Set("X-Auth-User", user)
+	r.Header.Set("X-Auth-Role", role)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
+// 普通用户隔离：只能看到/操作自己的账号，且不能调管理员端点。
+func TestMultiUserIsolation(t *testing.T) {
+	h, p := newTestHandler(t, "ok", "sk-admin")
+	p.Add(&cred.Cred{UID: "alice-1", Nickname: "alice-1", Owner: "alice", Token: "ck_a", Kind: cred.KindAPIKey})
+	p.Add(&cred.Cred{UID: "bob-1", Nickname: "bob-1", Owner: "bob", Token: "ck_b", Kind: cred.KindAPIKey})
+
+	// 1) 列表：alice 只看到自己的（看不到 acct-1 共享 / bob-1）
+	w := doAsUser(t, h, "GET", "/api/accounts", "alice", "user", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("alice accounts = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "alice-1") {
+		t.Fatal("alice should see her own account")
+	}
+	if strings.Contains(body, "bob-1") || strings.Contains(body, "acct-1") {
+		t.Fatalf("alice must not see others' accounts: %s", body)
+	}
+
+	// 2) 对象级：alice 不能 disable / remove / retest bob 的账号
+	if w := doAsUser(t, h, "POST", "/api/accounts/disable?uid=bob-1", "alice", "user", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("alice disable bob = %d, want 404", w.Code)
+	}
+	if w := doAsUser(t, h, "DELETE", "/api/accounts?uid=bob-1", "alice", "user", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("alice remove bob = %d, want 404", w.Code)
+	}
+	if w := doAsUser(t, h, "POST", "/api/accounts/retest?uid=bob-1", "alice", "user", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("alice retest bob = %d, want 404", w.Code)
+	}
+	// alice 可以操作自己的
+	if w := doAsUser(t, h, "POST", "/api/accounts/disable?uid=alice-1", "alice", "user", ""); w.Code != http.StatusOK {
+		t.Fatalf("alice disable own = %d, want 200", w.Code)
+	}
+
+	// 3) 管理员端点：普通用户 403
+	if w := doAsUser(t, h, "POST", "/api/accounts/reload", "alice", "user", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("alice reload = %d, want 403", w.Code)
+	}
+	if w := doAsUser(t, h, "POST", "/api/quota/limit?limit=100", "alice", "user", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("alice quota limit = %d, want 403", w.Code)
+	}
+
+	// 4) 管理员（全局 key）：能看到全部
+	if w := do(t, h, "GET", "/api/accounts", "sk-admin", ""); w.Code != http.StatusOK ||
+		!strings.Contains(w.Body.String(), "bob-1") || !strings.Contains(w.Body.String(), "acct-1") {
+		t.Fatalf("admin should see all accounts, got %d: %s", w.Code, w.Body.String())
+	}
+	// 5) 伪造：无身份头 + 无 key → 401（不能靠 X-Auth-User 绕过，因为它必须由 nginx 注入；
+	//    这里直接验证"不带任何凭证"被拒）
+	if w := do(t, h, "GET", "/api/accounts", "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("no creds = %d, want 401", w.Code)
+	}
+}

@@ -41,6 +41,7 @@ type Key struct {
 	Name      string    `json:"name"`
 	Key       string    `json:"key"`     // 明文，见包注释的取舍说明
 	Note      string    `json:"note,omitempty"`
+	Owner     string    `json:"owner,omitempty"` // 归属用户（SSO 用户名，多用户）；空 = 管理员/历史 key
 	CreatedAt time.Time `json:"created_at"`
 	LastUsed  time.Time `json:"last_used,omitempty"`
 }
@@ -132,17 +133,19 @@ func (s *Store) save() error { // 调用方须持锁
 	return os.Rename(tmp, s.filePath)
 }
 
-// Create 生成一个新 key。name 只用于展示。
-func (s *Store) Create(name, note string) (*Key, error) {
+// Create 生成一个新 key。name 只用于展示；owner 为空表示管理员/通用 key。
+// 名称唯一性按 owner 隔离：不同用户可以各自叫 "cc"。
+func (s *Store) Create(name, note, owner string) (*Key, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, fmt.Errorf("名称不能为空")
 	}
+	owner = strings.TrimSpace(owner)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, k := range s.keys {
-		if k.Name == name {
+		if k.Name == name && k.Owner == owner {
 			return nil, fmt.Errorf("名称 %q 已存在", name)
 		}
 	}
@@ -156,6 +159,7 @@ func (s *Store) Create(name, note string) (*Key, error) {
 		Name:      name,
 		Key:       secret,
 		Note:      strings.TrimSpace(note),
+		Owner:     owner,
 		CreatedAt: time.Now().UTC(),
 	}
 	s.keys[k.ID] = k
@@ -168,17 +172,35 @@ func (s *Store) Create(name, note string) (*Key, error) {
 	return k, nil
 }
 
-// Delete 吊销一个 key。
-func (s *Store) Delete(id string) error {
+// Delete 吊销一个 key。owner 非空时要求 key 归属匹配（普通用户只能删自己的）。
+func (s *Store) Delete(id, owner string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
 		return fmt.Errorf("key %q 不存在", id)
 	}
+	if owner != "" && k.Owner != owner {
+		return fmt.Errorf("key %q 不存在", id) // 不暴露他人 key 的存在性
+	}
 	delete(s.keys, id)
 	delete(s.bySecret, k.Key)
 	return s.save()
+}
+
+// Get 按 ID 取 key；owner 非空时要求归属匹配。
+func (s *Store) Get(id, owner string) (*Key, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k, ok := s.keys[id]
+	if !ok {
+		return nil, false
+	}
+	if owner != "" && k.Owner != owner {
+		return nil, false
+	}
+	cp := *k
+	return &cp, true
 }
 
 // Verify 校验明文 key 是否有效。命中时触发 onUsed 回调。
@@ -216,12 +238,15 @@ func (s *Store) Verify(secret string) (*Key, bool) {
 	return k, true
 }
 
-// List 返回全部 key（按创建时间正序）。
-func (s *Store) List() []*Key {
+// List 返回全部 key（按创建时间正序）。owner 非空时只返回该 owner 的 key。
+func (s *Store) List(owner string) []*Key {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	list := make([]*Key, 0, len(s.keys))
 	for _, k := range s.keys {
+		if owner != "" && k.Owner != owner {
+			continue
+		}
 		cp := *k
 		list = append(list, &cp)
 	}

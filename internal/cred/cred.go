@@ -37,6 +37,11 @@ type Cred struct {
 	UID      string
 	Nickname string
 
+	// Owner 账号归属（SSO 用户名，2026-09-21 多用户）。
+	// 空 = 无主账号（历史账号 / 管理员共享池），只有管理员视图可见与调度。
+	// 非空 = 该用户私有账号，选号时只在该 owner 的账号里挑。
+	Owner string
+
 	// Realm 凭证所属域："" 用全局上游（默认 CN copilot.tencent.com）；
 	// "saas" 表示来自 CodeBuddy OAuth 登录、走 www.codebuddy.ai。
 	Realm string
@@ -165,6 +170,13 @@ func LoadFile(path string) (*Cred, error) {
 			c.Realm = s
 		}
 	}
+	// 读取顶层 owner（多用户归属；管理员/历史凭证无此字段 = 无主）
+	if ob, ok := probe["owner"]; ok {
+		var s string
+		if json.Unmarshal(ob, &s) == nil {
+			c.Owner = strings.TrimSpace(s)
+		}
+	}
 	return &c, nil
 }
 
@@ -195,6 +207,9 @@ func SaveFile(dir string, c *Cred) (string, error) {
 		"uid":      c.UID,
 		"nickname": c.Nickname,
 		"type":     string(c.Kind),
+	}
+	if c.Owner != "" {
+		doc["owner"] = c.Owner
 	}
 	if c.Realm != "" {
 		doc["realm"] = c.Realm
