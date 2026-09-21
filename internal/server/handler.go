@@ -182,6 +182,7 @@ func NewHandler(cfg Config) *Handler {
 	// 管理 API
 	h.mux.HandleFunc("GET /api/status", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiStatus))
 	h.mux.HandleFunc("GET /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAccounts))
+	h.mux.HandleFunc("GET /api/owners", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiOwners))
 	h.mux.HandleFunc("POST /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAddAccount))
 	h.mux.HandleFunc("POST /api/accounts/test", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiTestAccount))
 	h.mux.HandleFunc("POST /api/accounts/retest", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRetest))
@@ -1537,13 +1538,39 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiStatus 状态总览。多用户：非管理员只看到自己账号的统计；管理员看全部。
+// apiStatus 状态总览。
+// 多用户语义（2026-09-21 二版，按站长要求拆分）：
+//   - 管理员默认只看**自己的池**（无主账号），成员账号走「成员」页单独查
+//     （?owner=<name>，仅管理员可用）；
+//   - 普通用户只看自己的账号。
 func (h *Handler) apiStatus(w http.ResponseWriter, r *http.Request) {
 	if isAdminReq(r) {
-		total, healthy := h.cfg.Pool.Count()
+		if o := strings.TrimSpace(r.URL.Query().Get("owner")); o != "" {
+			// 管理员按成员查看（「成员」页点进去）
+			list := h.cfg.Pool.ListFor(o)
+			healthy := 0
+			for _, st := range list {
+				if st.Healthy {
+					healthy++
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"accounts": list, "total": len(list), "healthy": healthy,
+				"owner": o,
+			})
+			return
+		}
+		// 管理员默认视图 = 自己的池（无主账号），与普通用户口径一致
+		list := h.cfg.Pool.ListFor("")
+		healthy := 0
+		for _, st := range list {
+			if st.Healthy {
+				healthy++
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"accounts":      h.cfg.Pool.ListAll(),
-			"total":         total,
+			"accounts":      list,
+			"total":         len(list),
 			"healthy":       healthy,
 			"has_api_key":   h.cfg.APIKey != "",
 			"upstream_base": h.cfg.Upstream.Base,
@@ -1566,9 +1593,21 @@ func (h *Handler) apiStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiOwners 成员列表（仅管理员）：谁在网关上有账号、各有几个。
+// 「成员」页用它画列表；点进某个成员再用 /api/status?owner=<name> 取明细。
+func (h *Handler) apiOwners(w http.ResponseWriter, r *http.Request) {
+	if !isAdminReq(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "需要管理员权限"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"owners": h.cfg.Pool.Owners()})
+}
+
 func (h *Handler) apiAccounts(w http.ResponseWriter, r *http.Request) {
 	if isAdminReq(r) {
-		writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.ListAll()})
+		// 管理员默认只看自己的池；?owner= 指定成员（「成员」页点进去时用）
+		o := strings.TrimSpace(r.URL.Query().Get("owner"))
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.ListFor(o)})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.ListFor(ownerOf(r))})

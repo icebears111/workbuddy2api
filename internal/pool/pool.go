@@ -561,3 +561,39 @@ func (p *Pool) saveLocked() {
 	}
 	_ = os.Rename(tmp, p.stateFp)
 }
+
+// OwnerSummary 一个成员的账号汇总（管理员「成员」页）。
+type OwnerSummary struct {
+	Owner   string `json:"owner"`
+	Total   int    `json:"total"`
+	Healthy int    `json:"healthy"`
+}
+
+// Owners 返回所有非空归属的账号汇总（谁在网关上有账号、各有几个）。
+// 无主账号（owner=""）不计入——它们属于管理员自己，见 ListFor("")。
+func (p *Pool) Owners() []OwnerSummary {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	agg := map[string]*OwnerSummary{}
+	for _, e := range p.byUID {
+		if e.c == nil || e.c.Owner == "" {
+			continue
+		}
+		s, ok := agg[e.c.Owner]
+		if !ok {
+			s = &OwnerSummary{Owner: e.c.Owner}
+			agg[e.c.Owner] = s
+		}
+		s.Total++
+		if e.healthy(now) {
+			s.Healthy++
+		}
+	}
+	out := make([]OwnerSummary, 0, len(agg))
+	for _, s := range agg {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Owner < out[j].Owner })
+	return out
+}
