@@ -353,10 +353,30 @@ func TestMultiUserIsolation(t *testing.T) {
 		t.Fatalf("alice quota limit = %d, want 403", w.Code)
 	}
 
-	// 4) 管理员（全局 key）：能看到全部
-	if w := do(t, h, "GET", "/api/accounts", "sk-admin", ""); w.Code != http.StatusOK ||
-		!strings.Contains(w.Body.String(), "bob-1") || !strings.Contains(w.Body.String(), "acct-1") {
-		t.Fatalf("admin should see all accounts, got %d: %s", w.Code, w.Body.String())
+	// 4) 管理员（全局 key）默认只看自己的池（无主账号）——成员账号走 ?owner= 单独查
+	w = do(t, h, "GET", "/api/accounts", "sk-admin", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("admin accounts = %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "acct-1") {
+		t.Fatalf("admin should see own (unowned) pool: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "bob-1") || strings.Contains(w.Body.String(), "alice-1") {
+		t.Fatalf("admin default view must not mix member accounts: %s", w.Body.String())
+	}
+	// 管理员按成员查（「成员」页点进去）：只见该成员
+	w = do(t, h, "GET", "/api/accounts?owner=alice", "sk-admin", "")
+	if !strings.Contains(w.Body.String(), "alice-1") || strings.Contains(w.Body.String(), "bob-1") {
+		t.Fatalf("admin ?owner=alice should show only alice: %s", w.Body.String())
+	}
+	// 成员列表：列出 alice 与 bob（不含无主）
+	w = do(t, h, "GET", "/api/owners", "sk-admin", "")
+	if !strings.Contains(w.Body.String(), "alice") || !strings.Contains(w.Body.String(), "bob") {
+		t.Fatalf("owners list should include alice and bob: %s", w.Body.String())
+	}
+	// 普通用户无权看成员列表
+	if w := doAsUser(t, h, "GET", "/api/owners", "alice", "user", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("user /api/owners = %d, want 403", w.Code)
 	}
 	// 5) 伪造：无身份头 + 无 key → 401（不能靠 X-Auth-User 绕过，因为它必须由 nginx 注入；
 	//    这里直接验证"不带任何凭证"被拒）
