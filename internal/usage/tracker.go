@@ -317,3 +317,46 @@ func (t *Tracker) save() {
 	b, _ := json.MarshalIndent(t.data, "", "  ")
 	_ = os.WriteFile(t.path, b, 0o644)
 }
+
+// FilterByAccounts 按账号子集过滤快照与明细（多用户视图）。
+// keep 为允许的账号 uid 集合；返回的快照只含这些账号的汇总/账本/明细。
+// 口径：Total/Today 重算为该子集的求和（不是全局值），避免泄露他人消耗规模。
+func (t *Tracker) FilterByAccounts(keep map[string]bool) Snapshot {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	accs := make(map[string]float64)
+	var total float64
+	for uid, v := range t.data.Accounts {
+		if keep[uid] {
+			accs[uid] = v
+			total += v
+		}
+	}
+	today := time.Now().Format(dateFmt)
+	var todaySum float64
+	todayAcc := make(map[string]float64)
+	for uid, v := range t.data.DailyAcct[today] {
+		if keep[uid] {
+			todayAcc[uid] = v
+			todaySum += v
+		}
+	}
+	recs := make([]Record, 0, len(t.data.Records))
+	for i := len(t.data.Records) - 1; i >= 0; i-- { // 倒序：最新在前
+		if keep[t.data.Records[i].UID] {
+			recs = append(recs, t.data.Records[i])
+		}
+	}
+	return Snapshot{
+		Total:          total,
+		Limit:          t.data.Limit,
+		Remaining:      t.data.Limit - total,
+		Accounts:       accs,
+		Today:          todaySum,
+		TodayDate:      today,
+		TodayByAccount: todayAcc,
+		Updated:        t.data.Updated,
+		Records:        recs,
+	}
+}

@@ -163,14 +163,27 @@ func (p *Pool) SyncToDir(creds []*cred.Cred) {
 // Pick 返回当前最合适的账号（错误最少 + 最久未用）。
 func (p *Pool) Pick() *cred.Cred { return p.PickExcluding(nil) }
 
+// PickFor 按归属选号（多用户）：
+//   - owner == ""：只在**无主账号**里选（管理员共享池，保持历史行为）。
+//   - owner != ""：只在该 owner 的私有账号里选。
+func (p *Pool) PickFor(owner string) *cred.Cred { return p.PickExcludingFor(owner, nil) }
+
 // PickExcluding 同上，跳过 tried（轮转重试用）。
 func (p *Pool) PickExcluding(tried map[string]bool) *cred.Cred {
+	return p.PickExcludingFor("", tried)
+}
+
+// PickExcludingFor 带归属的选号：owner 决定候选集（见 PickFor）。
+func (p *Pool) PickExcludingFor(owner string, tried map[string]bool) *cred.Cred {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		if !p.matchOwner(e, owner) {
 			continue
 		}
 		if !e.healthy(now) {
@@ -187,6 +200,45 @@ func (p *Pool) PickExcluding(tried map[string]bool) *cred.Cred {
 	p.seq++
 	best.seq = p.seq
 	return best.c
+}
+
+// PickAny 忽略归属选号（任何账号都可选）。
+// 用途：全局共享资源（如模型列表缓存）——它的结果对所有人相同，
+// 不属于任何租户，管理员池为空时也应能借用户账号拉取。
+func (p *Pool) PickAny(tried map[string]bool) *cred.Cred {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var best *entry
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue
+		}
+		if e.c == nil || !e.healthy(now) {
+			continue
+		}
+		if best == nil || pickPrefer(e, best) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	best.lastUsed = now
+	p.seq++
+	best.seq = p.seq
+	return best.c
+}
+
+// matchOwner 归属匹配：owner="" 只匹配无主账号；非空只匹配该 owner。
+func (p *Pool) matchOwner(e *entry, owner string) bool {
+	if e.c == nil {
+		return false
+	}
+	if owner == "" {
+		return e.c.Owner == ""
+	}
+	return e.c.Owner == owner
 }
 
 // pickPrefer 临期优先：带到期信息的 healthy 号优先；到期越早越先。
@@ -339,6 +391,57 @@ func (p *Pool) List() []Status {
 		out = append(out, p.statusOf(uid, p.byUID[uid]))
 	}
 	return out
+}
+
+// ListAll 返回全部账号（管理员视图：含各用户私有账号，便于运维介入）。
+func (p *Pool) ListAll() []Status {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	out := make([]Status, 0, len(uids))
+	for _, uid := range uids {
+		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	}
+	return out
+}
+
+// ListFor 按归属过滤账号列表（多用户）：
+//   - owner == ""：只返回无主账号（管理员共享池视图）。
+//   - owner != ""：只返回该 owner 的账号。
+func (p *Pool) ListFor(owner string) []Status {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if p.matchOwner(e, owner) {
+			uids = append(uids, uid)
+		}
+	}
+	sort.Strings(uids)
+	out := make([]Status, 0, len(uids))
+	for _, uid := range uids {
+		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	}
+	return out
+}
+
+// OwnerOf 返回账号归属；账号不存在返回 ("", false)。
+// 空字符串返回值表示「无主账号」，调用方据此做对象级越权校验。
+func (p *Pool) OwnerOf(uid string) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return "", false
+	}
+	if e.c == nil {
+		return "", true
+	}
+	return e.c.Owner, true
 }
 
 // Count 返回账号总数与可用数。

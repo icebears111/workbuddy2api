@@ -8,12 +8,23 @@ import (
 	"codebuddy2api/internal/cred"
 )
 
-// apiCheckin 一键签到：遍历 auths 下所有 OAuth 登录账号各签一次，聚合返回，并记录当天状态。
+// apiCheckin 一键签到：遍历 OAuth 登录账号各签一次，聚合返回，并记录当天状态。
+// 多用户：非管理员只签到/返回自己名下的账号（防止替他人触发上游操作）。
 func (h *Handler) apiCheckin(w http.ResponseWriter, r *http.Request) {
 	items, err := checkin.All(h.cfg.AuthDir, nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "加载凭证失败: " + err.Error()})
 		return
+	}
+	owner := ownerOf(r)
+	if owner != "" {
+		kept := items[:0]
+		for _, it := range items {
+			if o, exists := h.cfg.Pool.OwnerOf(it.UID); exists && o == owner {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
 	}
 	signed := 0
 	for _, it := range items {
@@ -34,7 +45,7 @@ func (h *Handler) apiCheckin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiCheckinStatus(w http.ResponseWriter, r *http.Request) {
 	date, byUID := checkin.Today(h.cfg.AuthDir)
 	out := []map[string]any{}
-	for _, st := range h.cfg.Pool.List() {
+	for _, st := range h.cfg.Pool.ListFor(ownerOf(r)) {
 		a := h.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.Kind != cred.KindToken {
 			continue
