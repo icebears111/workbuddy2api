@@ -15,6 +15,7 @@ import (
 
 	"codebuddy2api/internal/apikey"
 	"codebuddy2api/internal/cred"
+	"codebuddy2api/internal/modelstate"
 	"codebuddy2api/internal/pool"
 	"codebuddy2api/internal/scheduler"
 	"codebuddy2api/internal/server"
@@ -52,6 +53,12 @@ func main() {
 	} else {
 		log.Printf("loaded %d api key(s) from %s", keyStore.Count(), absKeysFile)
 	}
+
+	// 模型启停表。**永不失败**（NewStore 内部对坏文件容错）——
+	// 它的失败方向不该是「网关起不来」，那连转发都停了。
+	absModelsFile, _ := filepath.Abs(cfg.ModelsFile)
+	modelStore := modelstate.NewStore(absModelsFile)
+	log.Printf("model state: %d disabled (%s)", modelStore.Count(), absModelsFile)
 
 	// 加载凭证
 	creds, err := cred.LoadDir(absAuthDir)
@@ -135,6 +142,7 @@ func main() {
 		Upstream:      up,
 		APIKey:        cfg.APIKey,
 		KeyStore:      keyStore,
+		ModelState:    modelStore,
 		HardCooldown:  cfg.HardCreditDur,
 		SoftCooldown:  cfg.SoftRateDur,
 		ErrThreshold:  cfg.Cooldown.ErrThresh,

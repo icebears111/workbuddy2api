@@ -12,12 +12,14 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen     string  `json:"listen"`
-	APIKey     string  `json:"api_key"`
-	AuthDir    string  `json:"auth_dir"`
-	StateFile  string  `json:"state_file"`
+	Listen    string `json:"listen"`
+	APIKey    string `json:"api_key"`
+	AuthDir   string `json:"auth_dir"`
+	StateFile string `json:"state_file"`
 	// KeysFile 多 key 表（看板创建的调用凭证）。留空用 data/keys.json。
-	KeysFile   string  `json:"keys_file"`
+	KeysFile string `json:"keys_file"`
+	// ModelsFile 模型启停表（看板「模型」页禁用/恢复）。留空用 data/models.json。
+	ModelsFile string  `json:"models_file"`
 	UsageFile  string  `json:"usage_file"`
 	QuotaLimit float64 `json:"quota_limit"`
 	// FallbackModel 客户端传入上游不存在的模型（如 claude-* / gpt-*）时回落到该模型。
@@ -84,6 +86,7 @@ func Default() *Config {
 		AuthDir:    "./auths",
 		StateFile:  "./data/state.json",
 		KeysFile:   "./data/keys.json",
+		ModelsFile: "./data/models.json",
 		UsageFile:  "./data/usage.json",
 		QuotaLimit: 500,
 	}
@@ -142,6 +145,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CB2A_KEYS_FILE"); v != "" {
 		c.KeysFile = v
+	}
+	if v := os.Getenv("CB2A_MODELS_FILE"); v != "" {
+		c.ModelsFile = v
 	}
 	if v := os.Getenv("CB2A_UPSTREAM_BASE"); v != "" {
 		c.Upstream.Base = v

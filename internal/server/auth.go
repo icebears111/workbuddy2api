@@ -127,6 +127,7 @@ func requireAPIKey(apiKey string, store *apikey.Store, next http.HandlerFunc) ht
 // 返回 true 表示调用方有权操作该账号：
 //   - 管理员（owner==""）：可操作任何账号（含各用户的私有账号，便于运维介入）；
 //   - 普通用户：只能操作自己名下的账号；对他人/无主账号一律 false。
+//
 // 账号不存在同样返回 false（不暴露存在性差异）。
 func (h *Handler) ownAccount(r *http.Request, uid string) bool {
 	id, ok := identFrom(r)
@@ -141,4 +142,37 @@ func (h *Handler) ownAccount(r *http.Request, uid string) bool {
 		return false
 	}
 	return owner == id.Owner
+}
+
+// requireAdmin 只放行**管理员身份**——用于看板的管理写接口（如模型启停）。
+//
+// 与「只认全局 key」的取舍不同，这里判的是**身份是不是管理员**：
+//
+//	· 全局 key          → resolveIdentity 给 Admin=true，通过
+//	· SSO 管理员头      → role=admin 给 Admin=true，通过
+//	· 调用方 key（有主）→ Admin=false，拒绝
+//
+// 为什么不用「全局 key 才通过」：看板对管理员是**不注入 key、透传 SSO 身份**
+// 的（见 dashboard-api 的 _relay），只认 key 会把管理员自己也挡在门外。
+// 而调用方 key（带 owner）本来就该被挡 —— 那是发给「用模型」的凭证，
+// 不该能改网关配置，否则任何一把外传的 key 都能把模型全禁掉（拒绝服务）。
+func requireAdmin(apiKey string, store *apikey.Store, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if apiKey == "" && store == nil {
+			next(w, withIdent(r, Identity{Admin: true})) // 未配置鉴权 = 内网自用
+			return
+		}
+		id, ok := resolveIdentity(r, apiKey, store)
+		if !ok {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key",
+				"missing or invalid API key")
+			return
+		}
+		if !id.Admin {
+			writeOpenAIError(w, http.StatusForbidden, "forbidden",
+				"admin privilege required")
+			return
+		}
+		next(w, withIdent(r, id))
+	}
 }

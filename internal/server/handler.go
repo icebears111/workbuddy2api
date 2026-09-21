@@ -16,9 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"codebuddy2api/internal/authcb"
 	"codebuddy2api/internal/apikey"
+	"codebuddy2api/internal/authcb"
 	"codebuddy2api/internal/cred"
+	"codebuddy2api/internal/modelstate"
 	"codebuddy2api/internal/pool"
 	"codebuddy2api/internal/upstream"
 	"codebuddy2api/internal/usage"
@@ -42,6 +43,9 @@ type Config struct {
 	APIKey   string
 	// KeyStore 多 key 表；nil 表示只用全局 APIKey（兼容旧部署）。
 	KeyStore *apikey.Store
+	// ModelState 模型启停表（看板「模型」页禁用/恢复）；nil = 功能未启用
+	// （读作「没有任何模型被禁用」，而不是「全部禁用」）。
+	ModelState *modelstate.Store
 	// FallbackModel 上游不受支持的模型名（如 claude-* / gpt-*）回落到该模型。
 	// 留空时用 upstream.DefaultFallbackModel。
 	FallbackModel string
@@ -193,6 +197,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /api/accounts/disable", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiDisable))
 	h.mux.HandleFunc("DELETE /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRemove))
 	h.mux.HandleFunc("GET /api/models", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiModels))
+	// 看板「模型」页：读**含禁用项**的清单 / 启停。
+	// 守卫用 requireGlobalKey —— 调用方 key 不得改模型状态（与 key 管理同理）。
+	h.mux.HandleFunc("GET /api/models/manage", requireAdmin(cfg.APIKey, cfg.KeyStore, h.apiModelsManage))
+	h.mux.HandleFunc("POST /api/models/state", requireAdmin(cfg.APIKey, cfg.KeyStore, h.apiSetModelState))
 	h.mux.HandleFunc("GET /api/quota", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuota))
 	h.mux.HandleFunc("GET /api/quota/all", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaAll))
 	h.mux.HandleFunc("GET /api/quota/usage", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaUsage))
@@ -268,7 +276,13 @@ func (h *Handler) retiredProtocol(name string) http.HandlerFunc {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
-	ms := h.effectiveModels()
+	data := h.modelEntries(h.effectiveModels())
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// modelEntries 把内部模型结构转成 OpenAI 风格的响应条目。
+// listModels 与面板的 /api/models/manage 共用，字段因此不会漂移。
+func (h *Handler) modelEntries(ms []upstream.Model) []map[string]any {
 	data := make([]map[string]any, 0, len(ms))
 	for _, m := range ms {
 		entry := map[string]any{
@@ -294,11 +308,95 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 		}
 		data = append(data, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	return data
+}
+
+// modelDisabled 该模型是否被看板禁用（大小写不敏感；ModelState 为 nil 时恒 false）。
+func (h *Handler) modelDisabled(id string) bool {
+	return h.cfg.ModelState != nil && h.cfg.ModelState.IsDisabled(id)
+}
+
+// rejectDisabledModel 请求侧拦截：模型被禁用时写错误并返回 true。
+//
+// ★ 为什么必须在**这里**拦，而不是只从 /v1/models 藏起来 ★
+// buddy 的模型解析是 upstream.MapModelName(id, fallback)：不认识的模型名
+// **不会报错，而是静默改写成 fallback**（默认 hy4-preview）继续转发。
+// 于是「禁用」若只做在清单上，会出现最坏的结果 ——
+// 用户点名请求被禁的模型，网关**照常 200，但实际用的是另一个模型**，
+// 账单与输出都对不上，而且没有任何提示。
+// 所以这里要在 MapModelName 之前判一次，给出明确的 400。
+func (h *Handler) rejectDisabledModel(w http.ResponseWriter, id string) bool {
+	if id == "" || !h.modelDisabled(id) {
+		return false
+	}
+	writeOpenAIError(w, http.StatusBadRequest, "model_disabled",
+		fmt.Sprintf("model %q is disabled on this gateway (see /v1/models)", id))
+	return true
 }
 
 func (h *Handler) apiModels(w http.ResponseWriter, r *http.Request) {
 	h.listModels(w, r)
+}
+
+// apiModelsManage GET /api/models/manage —— 看板「模型」页的读接口。
+//
+// 与 /api/models（= /v1/models，已过滤禁用）分开：看板需要**看到被禁用的
+// 模型**才能把开关画出来。若共用一个过滤过的清单，用户在页面上禁掉一个模型
+// 之后它就消失了，再也没法恢复 —— 这是这个功能最容易做错的一处。
+func (h *Handler) apiModelsManage(w http.ResponseWriter, r *http.Request) {
+	ms := h.allModels()
+	out := make([]map[string]any, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, map[string]any{
+			"id":             m.ID,
+			"display_name":   m.DisplayName,
+			"enabled":        !h.modelDisabled(m.ID),
+			"reasoning":      m.Reasoning,
+			"vision":         m.Vision,
+			"context_length": m.ContextLen,
+			"cost_factor":    m.CostFactor,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models": out,
+		"count":  len(out),
+		"disabled_count": func() int {
+			if h.cfg.ModelState == nil {
+				return 0
+			}
+			return h.cfg.ModelState.Count()
+		}(),
+	})
+}
+
+// apiSetModelState POST /api/models/state
+// body {"id":"glm-5.2","enabled":false} —— 启停一个模型。
+func (h *Handler) apiSetModelState(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.ModelState == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "not_supported",
+			"model state store is not enabled on this gateway")
+		return
+	}
+	var body struct {
+		ID      string `json:"id"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "请求体不是合法 JSON")
+		return
+	}
+	if strings.TrimSpace(body.ID) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "缺少模型 id")
+		return
+	}
+	if body.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "缺少 enabled")
+		return
+	}
+	h.cfg.ModelState.SetDisabled(body.ID, !*body.Enabled)
+	log.Printf("models: %q enabled=%v (by admin API)", body.ID, *body.Enabled)
+	// 回最新清单，前端就地重绘
+	h.apiModelsManage(w, r)
 }
 
 // apiQuota 拉取指定（或首个健康）账号的上游套餐/额度信息，并合并本地累计消耗。
@@ -351,7 +449,24 @@ func (h *Handler) apiQuota(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// effectiveModels 对外模型清单（**已过滤禁用**）。/v1/models 用它。
 func (h *Handler) effectiveModels() []upstream.Model {
+	all := h.allModels()
+	if h.cfg.ModelState == nil {
+		return all
+	}
+	out := make([]upstream.Model, 0, len(all))
+	for _, m := range all {
+		if !h.modelDisabled(m.ID) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// allModels 完整清单，**不过滤禁用**。看板的管理页必须用它 ——
+// 过滤掉的话被禁用的模型从页面消失，用户再也找不到开关恢复它。
+func (h *Handler) allModels() []upstream.Model {
 	h.modelsMu.RLock()
 	if len(h.models) > 0 && time.Since(h.fetchedAt) < modelsTTL {
 		ms := h.models
@@ -434,6 +549,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var clientReq map[string]any
 	if err := json.Unmarshal(body, &clientReq); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "parse json: "+err.Error())
+		return
+	}
+
+	// 被看板禁用的模型：**必须在 MapModelName 之前拦**。
+	// 下面那句 MapModelName 会把不认识的模型静默改写成 fallback 继续转发 ——
+	// 于是「禁用了但用户仍能点名请求」会变成 200 + 用错模型，
+	// 账单和输出都对不上，还不给任何提示。这里是唯一的拦截点。
+	if h.rejectDisabledModel(w, probe.Model) {
 		return
 	}
 
@@ -938,6 +1061,12 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := req["stream"].(bool)
 
+	// 与 chatCompletions 同款拦截（这两个端点当前未注册，恒 410；
+	// 保留判断是为了将来恢复时不会漏掉禁用语义）。
+	if h.rejectDisabledModel(w, modelRaw) {
+		return
+	}
+
 	model, rewritten := upstream.MapModelName(modelRaw, h.cfg.FallbackModel)
 	if rewritten {
 		log.Printf("messages: model %q not supported by upstream, fallback to %q", modelRaw, model)
@@ -1023,6 +1152,12 @@ func (h *Handler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stream, _ := req["stream"].(bool)
+
+	// 与 chatCompletions 同款拦截（这两个端点当前未注册，恒 410；
+	// 保留判断是为了将来恢复时不会漏掉禁用语义）。
+	if h.rejectDisabledModel(w, modelRaw) {
+		return
+	}
 
 	model, rewritten := upstream.MapModelName(modelRaw, h.cfg.FallbackModel)
 	if rewritten {
@@ -1471,12 +1606,12 @@ func (h *Handler) apiUsageRecords(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"records":          recs,
 		"count":            len(recs),
-		"total":            snap.Total,            // 累计消耗（与额度卡一致的口径）
-		"limit":            snap.Limit,            // 看门狗上限
-		"today":            snap.Today,            // 今日已消耗（按天账本，不受环形缓冲条数限制）
-		"today_date":       snap.TodayDate,        // 今日日期（本地时区 YYYY-MM-DD）
-		"today_by_account": snap.TodayByAccount,   // 今日分账号消耗（uid → credit）
-		"updated":          snap.Updated,          // 最后一次累计时间
+		"total":            snap.Total,          // 累计消耗（与额度卡一致的口径）
+		"limit":            snap.Limit,          // 看门狗上限
+		"today":            snap.Today,          // 今日已消耗（按天账本，不受环形缓冲条数限制）
+		"today_date":       snap.TodayDate,      // 今日日期（本地时区 YYYY-MM-DD）
+		"today_by_account": snap.TodayByAccount, // 今日分账号消耗（uid → credit）
+		"updated":          snap.Updated,        // 最后一次累计时间
 	})
 }
 
