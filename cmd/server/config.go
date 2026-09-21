@@ -19,9 +19,13 @@ type Config struct {
 	// KeysFile 多 key 表（看板创建的调用凭证）。留空用 data/keys.json。
 	KeysFile string `json:"keys_file"`
 	// ModelsFile 模型启停表（看板「模型」页禁用/恢复）。留空用 data/models.json。
-	ModelsFile string  `json:"models_file"`
-	UsageFile  string  `json:"usage_file"`
-	QuotaLimit float64 `json:"quota_limit"`
+	ModelsFile string `json:"models_file"`
+	// UsageStatsFile token 用量 / 缓存命中统计（看板「缓存命中」）。
+	// 留空用 data/usage-stats.json。与 UsageFile（积分账本）是两回事：
+	// 那个管钱，这个管 token。
+	UsageStatsFile string  `json:"usage_stats_file"`
+	UsageFile      string  `json:"usage_file"`
+	QuotaLimit     float64 `json:"quota_limit"`
 	// FallbackModel 客户端传入上游不存在的模型（如 claude-* / gpt-*）时回落到该模型。
 	FallbackModel string `json:"fallback_model"`
 
@@ -81,14 +85,15 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:     ":7865",
-		APIKey:     "",
-		AuthDir:    "./auths",
-		StateFile:  "./data/state.json",
-		KeysFile:   "./data/keys.json",
-		ModelsFile: "./data/models.json",
-		UsageFile:  "./data/usage.json",
-		QuotaLimit: 500,
+		Listen:         ":7865",
+		APIKey:         "",
+		AuthDir:        "./auths",
+		StateFile:      "./data/state.json",
+		KeysFile:       "./data/keys.json",
+		ModelsFile:     "./data/models.json",
+		UsageStatsFile: "./data/usage-stats.json",
+		UsageFile:      "./data/usage.json",
+		QuotaLimit:     500,
 	}
 	c.FallbackModel = "hy4-preview"
 	c.Upstream.Env = "internal"
@@ -148,6 +153,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CB2A_MODELS_FILE"); v != "" {
 		c.ModelsFile = v
+	}
+	if v := os.Getenv("CB2A_USAGE_STATS_FILE"); v != "" {
+		c.UsageStatsFile = v
 	}
 	if v := os.Getenv("CB2A_UPSTREAM_BASE"); v != "" {
 		c.Upstream.Base = v

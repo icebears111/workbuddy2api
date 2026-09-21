@@ -23,6 +23,7 @@ import (
 	"codebuddy2api/internal/pool"
 	"codebuddy2api/internal/upstream"
 	"codebuddy2api/internal/usage"
+	"codebuddy2api/internal/usagestat"
 )
 
 //go:embed admin.html
@@ -46,6 +47,8 @@ type Config struct {
 	// ModelState 模型启停表（看板「模型」页禁用/恢复）；nil = 功能未启用
 	// （读作「没有任何模型被禁用」，而不是「全部禁用」）。
 	ModelState *modelstate.Store
+	// UsageStats token 用量 / 缓存命中的按桶统计（看板「缓存命中」）；nil = 不统计。
+	UsageStats *usagestat.Store
 	// FallbackModel 上游不受支持的模型名（如 claude-* / gpt-*）回落到该模型。
 	// 留空时用 upstream.DefaultFallbackModel。
 	FallbackModel string
@@ -200,6 +203,8 @@ func NewHandler(cfg Config) *Handler {
 	// 看板「模型」页：读**含禁用项**的清单 / 启停。
 	// 守卫用 requireGlobalKey —— 调用方 key 不得改模型状态（与 key 管理同理）。
 	h.mux.HandleFunc("GET /api/models/manage", requireAdmin(cfg.APIKey, cfg.KeyStore, h.apiModelsManage))
+	// 用量 / 缓存命中（看板「报表」页）：与模型启停同一道管理员守卫
+	h.mux.HandleFunc("GET /api/usage/stats", requireAdmin(cfg.APIKey, cfg.KeyStore, h.apiUsageStats))
 	h.mux.HandleFunc("POST /api/models/state", requireAdmin(cfg.APIKey, cfg.KeyStore, h.apiSetModelState))
 	h.mux.HandleFunc("GET /api/quota", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuota))
 	h.mux.HandleFunc("GET /api/quota/all", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaAll))
@@ -336,6 +341,30 @@ func (h *Handler) rejectDisabledModel(w http.ResponseWriter, id string) bool {
 
 func (h *Handler) apiModels(w http.ResponseWriter, r *http.Request) {
 	h.listModels(w, r)
+}
+
+// apiUsageStats GET /api/usage/stats —— 看板「报表」页的缓存命中面板。
+//
+// 与 agent2api 的同名能力的差别：他们从**逐条明细**按窗口求和，
+// 我们从**时间桶**加（见 internal/usagestat 包注释）。桶的好处是
+// 存储量与流量无关 —— 他们那份要覆盖 7 天得留几万条。
+func (h *Handler) apiUsageStats(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.UsageStats == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false, "note": "本网关未启用用量统计",
+			"rates": map[string]any{}, "trend24h": []any{},
+		})
+		return
+	}
+	now := time.Now()
+	hit, input := h.cfg.UsageStats.TotalSnapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":      true,
+		"rates":        h.cfg.UsageStats.Rates(now),
+		"trend24h":     h.cfg.UsageStats.Trend24h(now),
+		"total":        map[string]any{"hitTokens": hit, "inputTokens": input},
+		"generated_at": now.Unix(),
+	})
 }
 
 // apiModelsManage GET /api/models/manage —— 看板「模型」页的读接口。
@@ -1243,10 +1272,21 @@ func (h *Handler) recordUsage(uid string, resp map[string]any) {
 // 与 recordUsage 的区别：这里允许 credit 为 0（也记 token / 延迟），
 // 只用于展示；金额累计仍以 Add 为准，避免两边口径打架。
 func (h *Handler) recordConsumption(uid, model string, u map[string]any, start time.Time, stream bool) {
+	p, c, t := usage.TokenUsage(u)
+	// 缓存命中率的窗口统计（看板「报表」页）。
+	//
+	// ★ 这一段**必须在这儿**，且**不能**受下面的 Tracker 判空/探针过滤影响 ★
+	// 两个坑：
+	//   1. 放进 `if h.cfg.Tracker == nil { return }` 之后 → 没配积分账本时
+	//      统计完全不工作（第一版就是这样，测试里 hit=0）；
+	//   2. 放进「全零探针跳过」之后 → 探针请求确实不该进明细，但**它也可能
+	//      带缓存数据**，漏掉会让命中率的分母偏小。
+	// 统计是独立观测，只判自己那个 store 在不在。
+	h.recordCacheStats(u, p)
+
 	if h.cfg.Tracker == nil {
 		return
 	}
-	p, c, t := usage.TokenUsage(u)
 	// 全零的探针类请求（max_tokens<=2 短路或空 usage）不值得进明细
 	if p == 0 && c == 0 && t == 0 && usage.ExtractCredit(u) == 0 {
 		return
@@ -1258,10 +1298,21 @@ func (h *Handler) recordConsumption(uid, model string, u map[string]any, start t
 		PromptTokens:     p,
 		CompletionTokens: c,
 		TotalTokens:      t,
+		CacheReadTokens:  usage.CacheReadTokens(u),
 		Credit:           usage.ExtractCredit(u),
 		LatencyMS:        time.Since(start).Milliseconds(),
 		Stream:           stream,
 	})
+}
+
+// recordCacheStats 只做「按时间桶累计 token 与缓存命中」这一件事。
+// 与明细（Tracker）完全解耦：明细是逐条的、只有 200 条环形缓冲，
+// 覆盖不了 7 天；这里按桶累计比值，存储量与流量无关。
+func (h *Handler) recordCacheStats(u map[string]any, prompt int) {
+	if h.cfg.UsageStats == nil {
+		return
+	}
+	h.cfg.UsageStats.Add(time.Now(), int64(prompt), usagestat.CacheRead(u))
 }
 
 func (h *Handler) usageCallback(uid string) func(map[string]any) {

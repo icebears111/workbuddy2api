@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"codebuddy2api/internal/usagestat"
 )
 
 const defaultLimit = 500.0
@@ -51,9 +53,14 @@ type Record struct {
 	PromptTokens     int       `json:"prompt_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
 	TotalTokens      int       `json:"total_tokens"`
-	Credit           float64   `json:"credit"`
-	LatencyMS        int64     `json:"latency_ms"`
-	Stream           bool      `json:"stream,omitempty"`
+	// CacheReadTokens 命中缓存的输入 token（上游的 cache_read_tokens /
+	// prompt_tokens_details.cached_tokens 等，见 usagestat.CacheRead）。
+	// 缺失按 0 —— 「没上报」与「命中 0」在明细层面不做区分，
+	// 命中率的窗口统计另有 usagestat 负责（它可以按窗口忽略空数据）。
+	CacheReadTokens int     `json:"cache_read_tokens,omitempty"`
+	Credit          float64 `json:"credit"`
+	LatencyMS       int64   `json:"latency_ms"`
+	Stream          bool    `json:"stream,omitempty"`
 }
 
 // Snapshot 只读快照。
@@ -274,6 +281,13 @@ func ExtractCredit(usage map[string]any) float64 {
 // 上游同一响应里可能同时给 prompt_tokens/total_tokens 与
 // cache_* / completion_thinking_tokens 等扩展字段；这里只取三项通用值，
 // total 缺失时用 prompt+completion 兜底。
+// CacheReadTokens 从上游 usage 里取缓存命中数（字段名兼容见 usagestat）。
+// 单独一个函数而不是改 TokenUsage 的签名：那个函数有多个调用点，
+// 改签名要一路改过去，而缓存是**附加**信息，缺了不该影响既有逻辑。
+func CacheReadTokens(usage map[string]any) int {
+	return int(usagestat.CacheRead(usage))
+}
+
 func TokenUsage(usage map[string]any) (prompt, completion, total int) {
 	if usage == nil {
 		return 0, 0, 0

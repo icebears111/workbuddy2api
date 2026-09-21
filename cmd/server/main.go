@@ -21,6 +21,7 @@ import (
 	"codebuddy2api/internal/server"
 	"codebuddy2api/internal/upstream"
 	"codebuddy2api/internal/usage"
+	"codebuddy2api/internal/usagestat"
 )
 
 func main() {
@@ -59,6 +60,11 @@ func main() {
 	absModelsFile, _ := filepath.Abs(cfg.ModelsFile)
 	modelStore := modelstate.NewStore(absModelsFile)
 	log.Printf("model state: %d disabled (%s)", modelStore.Count(), absModelsFile)
+
+	// 用量 / 缓存命中统计。同样永不失败 —— 统计坏掉不该停转发。
+	absStatsFile, _ := filepath.Abs(cfg.UsageStatsFile)
+	usageStats := usagestat.New(absStatsFile)
+	log.Printf("usage stats: %s", absStatsFile)
 
 	// 加载凭证
 	creds, err := cred.LoadDir(absAuthDir)
@@ -143,6 +149,7 @@ func main() {
 		APIKey:        cfg.APIKey,
 		KeyStore:      keyStore,
 		ModelState:    modelStore,
+		UsageStats:    usageStats,
 		HardCooldown:  cfg.HardCreditDur,
 		SoftCooldown:  cfg.SoftRateDur,
 		ErrThreshold:  cfg.Cooldown.ErrThresh,
@@ -203,6 +210,8 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Print("bye")
+	// 用量统计是节流写盘的（20 秒一次），退出前补一次，否则最后一段请求会丢
+	usageStats.Flush()
 }
 
 // normalizeListenForLog 把 ":7865" 变成用于打印的 host:port。
