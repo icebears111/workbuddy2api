@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"codebuddy2api/internal/authcb"
+	"codebuddy2api/internal/apikey"
 	"codebuddy2api/internal/cred"
 	"codebuddy2api/internal/pool"
 	"codebuddy2api/internal/upstream"
@@ -39,6 +40,8 @@ type Config struct {
 	Pool     *pool.Pool
 	Upstream *upstream.Client
 	APIKey   string
+	// KeyStore 多 key 表；nil 表示只用全局 APIKey（兼容旧部署）。
+	KeyStore *apikey.Store
 	// FallbackModel 上游不受支持的模型名（如 claude-* / gpt-*）回落到该模型。
 	// 留空时用 upstream.DefaultFallbackModel。
 	FallbackModel string
@@ -161,41 +164,56 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), modelsSeen: map[string]bool{}}
 
 	// OpenAI 兼容 API（本网关只对外提供 OpenAI Chat，见 README「客户端接入」）
-	h.mux.HandleFunc("POST /v1/chat/completions", requireAPIKey(cfg.APIKey, h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", requireAPIKey(cfg.APIKey, h.listModels))
+	h.mux.HandleFunc("POST /v1/chat/completions", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.chatCompletions))
+	h.mux.HandleFunc("GET /v1/models", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.listModels))
 
 	// 已下线的协议端点：返回 410 Gone + 迁移提示（而不是 404，
 	// 避免客户端误以为路径写错而反复重试）。Claude Code / Codex CLI 不能直连
 	// 本网关，需先经转换层（CC Switch / claude-code-router / LiteLLM）转成
 	// OpenAI Chat。转换实现（upstream/anthropic.go、responses.go）保留在代码里，
 	// 供测试与将来恢复使用。
-	h.mux.HandleFunc("POST /v1/responses", requireAPIKey(cfg.APIKey, h.retiredProtocol("Responses 协议（Codex CLI）")))
-	h.mux.HandleFunc("POST /v1/messages", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", requireAPIKey(cfg.APIKey, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
+	h.mux.HandleFunc("POST /v1/responses", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.retiredProtocol("Responses 协议（Codex CLI）")))
+	h.mux.HandleFunc("POST /v1/messages", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.retiredProtocol("Anthropic Messages 协议（Claude Code）")))
 
 	// 健康检查（不认证，给容器 healthcheck 用）
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 
 	// 管理 API
-	h.mux.HandleFunc("GET /api/status", requireAPIKey(cfg.APIKey, h.apiStatus))
-	h.mux.HandleFunc("GET /api/accounts", requireAPIKey(cfg.APIKey, h.apiAccounts))
-	h.mux.HandleFunc("POST /api/accounts", requireAPIKey(cfg.APIKey, h.apiAddAccount))
-	h.mux.HandleFunc("POST /api/accounts/test", requireAPIKey(cfg.APIKey, h.apiTestAccount))
-	h.mux.HandleFunc("POST /api/accounts/retest", requireAPIKey(cfg.APIKey, h.apiRetest))
-	h.mux.HandleFunc("POST /api/accounts/reload", requireAPIKey(cfg.APIKey, h.apiReload))
-	h.mux.HandleFunc("GET /api/auth/start", requireAPIKey(cfg.APIKey, h.apiAuthStart))
-	h.mux.HandleFunc("POST /api/auth/poll", requireAPIKey(cfg.APIKey, h.apiAuthPoll))
-	h.mux.HandleFunc("POST /api/accounts/enable", requireAPIKey(cfg.APIKey, h.apiEnable))
-	h.mux.HandleFunc("POST /api/accounts/disable", requireAPIKey(cfg.APIKey, h.apiDisable))
-	h.mux.HandleFunc("DELETE /api/accounts", requireAPIKey(cfg.APIKey, h.apiRemove))
-	h.mux.HandleFunc("GET /api/models", requireAPIKey(cfg.APIKey, h.apiModels))
-	h.mux.HandleFunc("GET /api/quota", requireAPIKey(cfg.APIKey, h.apiQuota))
-	h.mux.HandleFunc("GET /api/quota/all", requireAPIKey(cfg.APIKey, h.apiQuotaAll))
-	h.mux.HandleFunc("GET /api/quota/usage", requireAPIKey(cfg.APIKey, h.apiQuotaUsage))
-	h.mux.HandleFunc("GET /api/usage/records", requireAPIKey(cfg.APIKey, h.apiUsageRecords))
-	h.mux.HandleFunc("POST /api/quota/limit", requireAPIKey(cfg.APIKey, h.apiQuotaLimit))
-	h.mux.HandleFunc("POST /api/checkin", requireAPIKey(cfg.APIKey, h.apiCheckin))
-	h.mux.HandleFunc("GET /api/checkin/status", requireAPIKey(cfg.APIKey, h.apiCheckinStatus))
+	h.mux.HandleFunc("GET /api/status", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiStatus))
+	h.mux.HandleFunc("GET /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAccounts))
+	h.mux.HandleFunc("POST /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAddAccount))
+	h.mux.HandleFunc("POST /api/accounts/test", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiTestAccount))
+	h.mux.HandleFunc("POST /api/accounts/retest", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRetest))
+	h.mux.HandleFunc("POST /api/accounts/reload", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiReload))
+	h.mux.HandleFunc("GET /api/auth/start", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAuthStart))
+	h.mux.HandleFunc("POST /api/auth/poll", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiAuthPoll))
+	h.mux.HandleFunc("POST /api/accounts/enable", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiEnable))
+	h.mux.HandleFunc("POST /api/accounts/disable", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiDisable))
+	h.mux.HandleFunc("DELETE /api/accounts", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiRemove))
+	h.mux.HandleFunc("GET /api/models", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiModels))
+	h.mux.HandleFunc("GET /api/quota", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuota))
+	h.mux.HandleFunc("GET /api/quota/all", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaAll))
+	h.mux.HandleFunc("GET /api/quota/usage", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaUsage))
+	h.mux.HandleFunc("GET /api/usage/records", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiUsageRecords))
+	h.mux.HandleFunc("POST /api/quota/limit", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiQuotaLimit))
+	h.mux.HandleFunc("POST /api/checkin", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiCheckin))
+	h.mux.HandleFunc("GET /api/checkin/status", requireAPIKey(cfg.APIKey, cfg.KeyStore, h.apiCheckinStatus))
+
+	// 多 key 管理：给调用方发放独立凭证（可按人吊销）。
+	// 复用 /admin/api/* 同款鉴权 —— 不引入第二套认证逻辑。
+	// 注意：route 必须带方法（GET/POST/DELETE）注册，不能只注册路径。
+	// 否则与下面更宽的 "GET /admin/" 冲突，Go 1.22+ 的 ServeMux 直接 panic。
+	if cfg.KeyStore != nil {
+		guard := func(next http.HandlerFunc) http.HandlerFunc {
+			return requireAPIKey(cfg.APIKey, cfg.KeyStore, next)
+		}
+		kh := apikey.NewHandler(cfg.KeyStore)
+		h.mux.HandleFunc("GET /admin/api/keys", guard(kh.List))
+		h.mux.HandleFunc("POST /admin/api/keys", guard(kh.Create))
+		h.mux.HandleFunc("DELETE /admin/api/keys/", guard(kh.Delete))
+		h.mux.HandleFunc("GET /admin/api/keys/", guard(kh.Get))
+	}
 
 	// 前端
 	h.mux.HandleFunc("GET /admin", h.serveAdmin)
