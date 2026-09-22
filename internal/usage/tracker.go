@@ -15,9 +15,34 @@ import (
 
 const defaultLimit = 500.0
 
-// maxRecords 消费明细环形缓冲容量：只保留最近这么多次真实请求，
-// 再多就丢最旧的（明细是「看最近烧了什么」，不是账本）。
-const maxRecords = 200
+// maxRecords 消费明细环形缓冲的**默认**容量。
+//
+// 2026-09-22：200 → 10000。
+// 原来写死 200 的问题是**繁忙时只覆盖几十分钟**：实测本网关单小时 262 次
+// 调用，200 条只够 45 分钟 —— 看板的「今天 / 近 7 天」全是空的，
+// 而用户看到的是一排空柱，会读成「那几天没有用量」。
+// 数据在被读之前就已经被丢掉了，这比数字不准更糟。
+//
+// ⚠ 代价（实测，不是估算）：save() 是整文件重写，随条数线性变贵。
+//
+//	生产机（Xeon + 云盘）json.MarshalIndent + os.WriteFile：
+//	   200 条  1.9ms /  0.07MB      2000 条  17ms /  0.66MB
+//	 10000 条  113ms /  3.27MB     50000 条  490ms / 16.35MB
+//	而 save() 是在**请求路径**上被调的（Record 与 Add 都在流式响应的
+//	usage 回调里），且持写锁 —— 所以 10000 条意味着每次对话末尾多
+//	~200ms（Record + Add 各一次），并发时还会互相排队。
+//
+//	这个延迟是已知代价，用户 2026-09-22 明确选择先接受（"回调的事先记下"）。
+//	根治办法是把明细拆到独立文件、append 追加写，不再每次重写全量 ——
+//	那是下一步，不是这一轮。
+//
+// 可用 config.json 的 usage_max_records 覆盖（见 cmd/server/config.go）。
+const maxRecords = 10000
+
+// maxRecordsCeiling 配置允许的上限。
+// 100000 条时整文件 32.7MB、单次 save() 实测 1093ms —— 那已经比多数
+// 请求本身还慢了，再往上调必须先把落盘改成追加写，而不是继续加这个数。
+const maxRecordsCeiling = 100000
 
 // 按天账本：Daily 以本地日期（YYYY-MM-DD）为键累计当日消耗。
 // 看板「今日使用额度」依赖它——环形缓冲只有 200 条，繁忙时覆盖不了
@@ -33,6 +58,11 @@ type Tracker struct {
 	mu   sync.RWMutex
 	path string
 	data persisted
+
+	// max 本实例的明细条数上限（默认 maxRecords）。
+	// 放实例上而不是直接用常量：不同部署的流量差几个数量级，
+	// 让配置能覆盖，但默认值仍然是能用的。
+	max int
 }
 
 type persisted struct {
@@ -78,6 +108,12 @@ type Snapshot struct {
 
 // New 创建/加载 Tracker。limit 为 0 时使用默认 500。
 func New(path string, limit float64) *Tracker {
+	return NewWithCap(path, limit, maxRecords)
+}
+
+// NewWithCap 与 New 相同，但可指定明细条数上限。
+// cap <= 0 时用默认值；超过 maxRecordsCeiling 时夹到上限（见那里的说明）。
+func NewWithCap(path string, limit float64, cap int) *Tracker {
 	if path == "" {
 		path = "usage.json"
 	}
@@ -86,7 +122,13 @@ func New(path string, limit float64) *Tracker {
 			path = abs
 		}
 	}
-	t := &Tracker{path: path}
+	if cap <= 0 {
+		cap = maxRecords
+	}
+	if cap > maxRecordsCeiling {
+		cap = maxRecordsCeiling
+	}
+	t := &Tracker{path: path, max: cap}
 	if limit <= 0 {
 		limit = defaultLimit
 	}
@@ -196,9 +238,9 @@ func (t *Tracker) Record(rec Record) {
 		rec.At = time.Now()
 	}
 	t.data.Records = append(t.data.Records, rec)
-	if len(t.data.Records) > maxRecords {
-		// 环形裁剪：保留最近 maxRecords 条
-		t.data.Records = append([]Record(nil), t.data.Records[len(t.data.Records)-maxRecords:]...)
+	if n := t.max; n > 0 && len(t.data.Records) > n {
+		// 环形裁剪：保留最近 n 条
+		t.data.Records = append([]Record(nil), t.data.Records[len(t.data.Records)-n:]...)
 	}
 	t.save()
 }

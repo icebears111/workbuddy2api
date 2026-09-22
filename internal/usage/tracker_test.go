@@ -8,16 +8,20 @@ import (
 )
 
 // TestRecordRingBufferAndOrder 锁定消费明细的两个契约：
-//  1. 只保留最近 maxRecords 条（超出丢最旧）
+//  1. 只保留最近 cap 条（超出丢最旧）
 //  2. Records() 最新在前；Snapshot() 内嵌明细同样最新在前
+//
+// 用小上限跑而不是默认的 10000：每次 Record 都整文件落盘，
+// 一万条会把测试拖到几十秒。默认值本身由 TestRecordCapDefaults 覆盖。
 func TestRecordRingBufferAndOrder(t *testing.T) {
-	tr := New(filepath.Join(t.TempDir(), "usage.json"), 500)
-	for i := 0; i < maxRecords+20; i++ {
+	const cap = 200
+	tr := NewWithCap(filepath.Join(t.TempDir(), "usage.json"), 500, cap)
+	for i := 0; i < cap+20; i++ {
 		tr.Record(Record{Model: "m", Credit: 0.01, TotalTokens: 10})
 	}
 	recs := tr.Records()
-	if len(recs) != maxRecords {
-		t.Fatalf("len(records) = %d, want %d", len(recs), maxRecords)
+	if len(recs) != cap {
+		t.Fatalf("len(records) = %d, want %d", len(recs), cap)
 	}
 	// 倒序：最新在前 —— 用时间戳单调性间接验证（同一批 Record 时间递增）
 	for i := 1; i < len(recs); i++ {
@@ -26,8 +30,8 @@ func TestRecordRingBufferAndOrder(t *testing.T) {
 		}
 	}
 	// Snapshot 内嵌明细不能为空、且不因二次取锁而死锁（会被 go test 超时捕获）
-	if got := len(tr.Snapshot().Records); got != maxRecords {
-		t.Fatalf("snapshot records = %d, want %d", got, maxRecords)
+	if got := len(tr.Snapshot().Records); got != cap {
+		t.Fatalf("snapshot records = %d, want %d", got, cap)
 	}
 }
 
@@ -153,5 +157,47 @@ func TestTodayByAccount(t *testing.T) {
 	again := New(path, 500)
 	if got := again.Snapshot().TodayByAccount["u1"]; got != 0.75 {
 		t.Fatalf("reloaded today_by_account[u1] = %v, want 0.75", got)
+	}
+}
+
+// TestRecordCapDefaults 锁定默认值与配置覆盖的关系。
+//
+// 2026-09-22 的改动起因：原默认 200 条在繁忙网关只覆盖 45 分钟，
+// 看板的「今天 / 近 7 天」全是空柱 —— 数据在读之前就被丢了。
+func TestRecordCapDefaults(t *testing.T) {
+	// 默认值：不传 cap 时用 maxRecords
+	if tr := New(t.TempDir()+"/u.json", 500); tr.max != maxRecords {
+		t.Fatalf("默认 cap = %d, want %d", tr.max, maxRecords)
+	}
+	// 配置覆盖生效
+	if tr := NewWithCap(t.TempDir()+"/u.json", 500, 3000); tr.max != 3000 {
+		t.Fatalf("cap = %d, want 3000（配置没生效）", tr.max)
+	}
+	// 0/负数回落默认值，而不是变成「不裁剪」或「裁到 0」
+	for _, bad := range []int{0, -1, -999} {
+		if tr := NewWithCap(t.TempDir()+"/u.json", 500, bad); tr.max != maxRecords {
+			t.Fatalf("cap=%d 时 tr.max = %d, want %d（应回落默认）", bad, tr.max, maxRecords)
+		}
+	}
+	// 超上限要夹住：否则单次落盘上百毫秒，拖慢转发
+	if tr := NewWithCap(t.TempDir()+"/u.json", 500, maxRecordsCeiling*3); tr.max != maxRecordsCeiling {
+		t.Fatalf("cap 超限时 = %d, want %d（应夹到上限）", tr.max, maxRecordsCeiling)
+	}
+}
+
+// TestRecordCapHonored 上限真的会被执行（不是只存了个字段）。
+func TestRecordCapHonored(t *testing.T) {
+	const cap = 50
+	tr := NewWithCap(t.TempDir()+"/u.json", 500, cap)
+	for i := 0; i < cap*3; i++ {
+		tr.Record(Record{Model: "m", Credit: 0.01})
+	}
+	if got := len(tr.Records()); got != cap {
+		t.Fatalf("条数 = %d, want %d（超出上限没被裁）", got, cap)
+	}
+	// 留下的必须是最新的那批
+	recs := tr.Records()
+	if !recs[0].At.After(recs[len(recs)-1].At) && !recs[0].At.Equal(recs[len(recs)-1].At) {
+		t.Fatalf("留下的不是最新的：首条 %s 不晚于末条 %s", recs[0].At, recs[len(recs)-1].At)
 	}
 }

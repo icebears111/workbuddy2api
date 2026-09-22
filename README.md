@@ -105,6 +105,7 @@ curl http://localhost:7865/v1/chat/completions \
   "state_file": "./data/state.json",  // 账号池/冷却状态持久化
   "usage_file": "./data/usage.json",  // 本地用量累计
   "quota_limit": 500,                 // 用量看门狗上限
+  "usage_max_records": 10000,        // 消费明细保留条数（看板「消费」页）
   "fallback_model": "hy4-preview",    // 上游未知模型名兜底
 
   "upstream": {
@@ -140,15 +141,16 @@ curl http://localhost:7865/v1/chat/completions \
 
 > 说明：上例 `features.hide_reasoning` 显式设为 **false**，是为了**保留 `reasoning_content`** 便于直连观测 / 调试。若 `features` 段整体缺省，则走代码内置默认，此时 `hide_reasoning=true`（更贴近标准 OpenAI 流）。实际行为以你 config.json 里写的值为准，本文档仅作说明，不改动任何默认值。
 
-### 环境变量覆盖（前缀 `WB2A_`）
+### 环境变量覆盖（前缀 `CB2A_`）
 
-下列配置项支持同名环境变量覆盖（`WB2A_` + 大写下划线），优先级高于 config.json；未列出的项（如 `usage_file`、`quota_limit`、`schedule.check_hours`）仅能通过 config.json 配置：
+下列配置项支持同名环境变量覆盖（`CB2A_` + 大写下划线），优先级高于 config.json；未列出的项（如 `usage_file`、`quota_limit`、`schedule.check_hours`）仅能通过 config.json 配置：
 
-`WB2A_LISTEN` / `WB2A_API_KEY` / `WB2A_AUTH_DIR` / `WB2A_FALLBACK_MODEL` / `WB2A_STATE_FILE`
-`WB2A_UPSTREAM_BASE` / `WB2A_UPSTREAM_ENV` / `WB2A_OAUTH_TOKEN_URL` / `WB2A_OAUTH_CLIENT_ID`
-`WB2A_HARD_CREDIT` / `WB2A_SOFT_RATE` / `WB2A_ERR_THRESHOLD` / `WB2A_ERR_COOLDOWN` / `WB2A_TIMEOUT_SECONDS`
-`WB2A_AUTO_CHECKIN` / `WB2A_CHECKIN_START_HOUR` / `WB2A_CHECKIN_END_HOUR`
-`WB2A_DESENSITIZE` / `WB2A_DESENSITIZE_TOOLS` / `WB2A_STRIP_TOOL_METADATA` / `WB2A_HIDE_REASONING` / `WB2A_MIN_REASONING_EFFORT`
+`CB2A_LISTEN` / `CB2A_API_KEY` / `CB2A_AUTH_DIR` / `CB2A_FALLBACK_MODEL` / `CB2A_STATE_FILE`
+`CB2A_UPSTREAM_BASE` / `CB2A_UPSTREAM_ENV` / `CB2A_OAUTH_TOKEN_URL` / `CB2A_OAUTH_CLIENT_ID`
+`CB2A_HARD_CREDIT` / `CB2A_SOFT_RATE` / `CB2A_ERR_THRESHOLD` / `CB2A_ERR_COOLDOWN` / `CB2A_TIMEOUT_SECONDS`
+`CB2A_AUTO_CHECKIN` / `CB2A_CHECKIN_START_HOUR` / `CB2A_CHECKIN_END_HOUR`
+`CB2A_USAGE_MAX_RECORDS`（消费明细条数上限）
+`CB2A_DESENSITIZE` / `CB2A_DESENSITIZE_TOOLS` / `CB2A_STRIP_TOOL_METADATA` / `CB2A_HIDE_REASONING` / `CB2A_MIN_REASONING_EFFORT`
 
 ---
 
@@ -245,7 +247,7 @@ cd /opt/codebuddy2api
 ```bash
 go build ./...          # 编译全部
 go test ./...           # 运行单元 / 协议 / 池测试
-go run ./cmd/check -key ck_xxx   # 探测某个 Key 可用性与可见模型（或设环境变量 WB2A_KEY）
+go run ./cmd/check -key ck_xxx   # 探测某个 Key 可用性与可见模型（或设环境变量 CB2A_KEY）
 ```
 
 - 代码无第三方运行时依赖（标准库实现），测试覆盖池状态机、协议转换、错误分类等核心逻辑。

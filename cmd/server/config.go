@@ -26,6 +26,14 @@ type Config struct {
 	UsageStatsFile string  `json:"usage_stats_file"`
 	UsageFile      string  `json:"usage_file"`
 	QuotaLimit     float64 `json:"quota_limit"`
+	// UsageMaxRecords 消费明细保留条数（看板「消费」页那张表）。
+	// 0 或负数 = 用内置默认（见 usage.maxRecords）。上限 100000。
+	//
+	// 为什么要可配：这个数**取决于流量**。按条数算覆盖时长是
+	// 「条数 ÷ 每小时请求数」，单机小流量配 1000 就够看一周，
+	// 繁忙网关（实测单小时 262 次）要 10000 才能覆盖一天。
+	// 写死一个数字必然在某一端不合适。
+	UsageMaxRecords int `json:"usage_max_records"`
 	// FallbackModel 客户端传入上游不存在的模型（如 claude-* / gpt-*）时回落到该模型。
 	FallbackModel string `json:"fallback_model"`
 
@@ -156,6 +164,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CB2A_USAGE_STATS_FILE"); v != "" {
 		c.UsageStatsFile = v
+	}
+	if v := os.Getenv("CB2A_USAGE_MAX_RECORDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.UsageMaxRecords = n
+		}
 	}
 	if v := os.Getenv("CB2A_UPSTREAM_BASE"); v != "" {
 		c.Upstream.Base = v

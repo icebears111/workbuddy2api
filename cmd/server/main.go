@@ -161,7 +161,7 @@ func main() {
 		OnRemove:      onRemove,
 		TokenURL:      cfg.OAuth.TokenURL,
 		ClientID:      cfg.OAuth.ClientID,
-		Tracker:       usage.New(absUsageFile, cfg.QuotaLimit),
+		Tracker:       usage.NewWithCap(absUsageFile, cfg.QuotaLimit, cfg.UsageMaxRecords),
 		Realms: map[string]server.RealmConfig{
 			// CN 控制台域（ck_ Key），沿用全局上游。
 			"cn": {
