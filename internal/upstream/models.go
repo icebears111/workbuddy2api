@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,7 +23,19 @@ type Model struct {
 	ContextLen  int64   `json:"context_length,omitempty"`
 	Reasoning   bool    `json:"reasoning,omitempty"`
 	Vision      bool    `json:"vision,omitempty"`
-	CostFactor  float64 `json:"cost_factor,omitempty"` // 相对于基座的额度消耗系数
+	CostFactor  float64 `json:"cost_factor,omitempty"` // 旧字段：上游已不再返回，保留兼容
+	// Credits 上游给的**额度消耗倍数**（字段名 credits，字符串 "x0.21"）。
+	//
+	// ⚠ 这是 CodeBuddy **自己的**计价口径，与 Qoder 的 PriceFactor 不是
+	// 一个体系 —— 两家的「1.0」不表示同一个价格。前端因此分成各自的列，
+	// 不合并成一个「倍率」（合并会让用户拿不同厂商的数字互相比较）。
+	Credits float64 `json:"credits,omitempty"`
+	// HasCredits 上游是否真的给了这个字段。
+	//
+	// 为什么要单独一个布尔：倍率可以是 **0.00**（实测 hy3 就是 "x0.00"，
+	// 表示不消耗额度），用 `Credits != 0` 判「有没有」会把这种合法的 0
+	// 当成「没有」，界面上就显示成「—」了 —— 那是两回事。
+	HasCredits bool `json:"has_credits,omitempty"`
 }
 
 // FetchModels 拉取上游模型列表（默认 base + /v2/models → /v3/config 回退，带 15s 超时）。
@@ -230,10 +243,65 @@ func modelFromMap(m map[string]any) *Model {
 	out.ContextLen = pickInt(m, "max_input_tokens", "maxInputTokens", "context_length", "contextLength", "max_context_tokens")
 	out.Reasoning = pickBool(m, "is_reasoning", "reasoning", "isReasoning", "support_reasoning")
 	out.Vision = pickBool(m, "is_vl", "vision", "isVL", "support_vision")
+	// 倍率：上游叫 credits，值是**字符串** "x0.21"（不是数字）。
+	// 见 CreditMultiplier 的说明 —— 这是 CodeBuddy 独有的口径，
+	// Qoder 的 price_factor 是另一回事，不要混。
+	if v, ok := pickMultiplier(m, "credits"); ok {
+		out.Credits = v
+		out.HasCredits = true
+	}
 	if out.ID == "" {
 		return nil
 	}
 	return &out
+}
+
+// CreditMultiplier 上游 credits 字符串 → 数字。
+//
+// 上游给的是 **"x0.21" 这种带 x 前缀的字符串**（也可能是 "x2.00"），
+// 所以不能当数字直接解析。实测 51 个模型里 32 个带这个字段。
+//
+// 语义：这是 CodeBuddy 自己的**额度消耗倍数**（相对基座），
+// 与 Qoder 的 price_factor 不是一个体系 —— 两家各自标各自的，
+// 放在一列里比较是错的（前端已拆成各自的列）。
+func CreditMultiplier(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "x")
+	s = strings.TrimPrefix(s, "X")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// pickMultiplier 从若干键名里取第一个能解析成倍率的值。
+// 兼容字符串（"x0.21"）与数字（0.21）两种形态 —— 上游将来若改成数字，
+// 这里不用跟着改。
+func pickMultiplier(m map[string]any, keys ...string) (float64, bool) {
+	for _, k := range keys {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			if f, ok := CreditMultiplier(t); ok {
+				return f, true
+			}
+		case float64:
+			return t, true
+		case json.Number:
+			if f, err := t.Float64(); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func pickString(m map[string]any, keys ...string) string {
@@ -331,31 +399,35 @@ func MapModelName(id, fallback string) (mapped string, rewritten bool) {
 	return fallback, true
 }
 
-// FallbackModels 静态回退表：上游没有对外开放的模型列表 API（实测 /v2/models 404、
-// /v3/config 也不含模型），这里根据用户截图 + 对话接口实测得到的可用模型清单。
-// cost_factor 来自 CodeBuddy UI 的「x」倍数；截图中未出现的模型不填。
-// 注意：清单随时可能随 CodeBuddy 调整，新增/变更请以对话实测为准。
+// FallbackModels 静态回退表 —— 只在**所有域都拉不到**时用。
+//
+// ⚠ 2026-09-23 起上游的模型清单是实时拉取的（/v3/config，见 ModelsUserAgent），
+// 这张表已经**不是主要来源**了，只作兜底。因此它天然会过期 ——
+// 实测它的 kimi-k3 与上游当前的 kimi-k3-1 就对不上（好在旧名仍可用）。
+// 别把它当真值修；真值以上游为准。
+//
+// credits 是 CodeBuddy 自己的额度倍数口径（上游字段名 credits，字符串 "x0.21"）。
 func FallbackModels() []Model {
 	return []Model{
 		{ID: "auto", DisplayName: "自动（Auto）"},
 		{ID: "default", DisplayName: "默认（Default）"},
-		{ID: "hy3", DisplayName: "混元 Hy3", CostFactor: 0.00},
-		{ID: "hy4-preview", DisplayName: "混元 Hy4-Preview", CostFactor: 0.00},
-		{ID: "deepseek-v4-flash", DisplayName: "DeepSeek-V4-Flash", CostFactor: 0.17},
-		{ID: "deepseek-v4.1-flash", DisplayName: "DeepSeek-V4.1-Flash", CostFactor: 0.03},
-		{ID: "deepseek-v4-pro", DisplayName: "DeepSeek-V4-Pro", CostFactor: 0.51},
+		{ID: "hy3", DisplayName: "混元 Hy3", Credits: 0.00, HasCredits: true},
+		{ID: "hy4-preview", DisplayName: "混元 Hy4-Preview", Credits: 0.00, HasCredits: true},
+		{ID: "deepseek-v4-flash", DisplayName: "DeepSeek-V4-Flash", Credits: 0.17, HasCredits: true},
+		{ID: "deepseek-v4.1-flash", DisplayName: "DeepSeek-V4.1-Flash", Credits: 0.03, HasCredits: true},
+		{ID: "deepseek-v4-pro", DisplayName: "DeepSeek-V4-Pro", Credits: 0.51, HasCredits: true},
 		{ID: "deepseek-v3", DisplayName: "DeepSeek-V3"},
 		{ID: "deepseek-v3.2", DisplayName: "DeepSeek-V3.2"},
 		{ID: "deepseek-r1", DisplayName: "DeepSeek-R1", Reasoning: true},
-		{ID: "glm-5.1", DisplayName: "GLM-5.1", CostFactor: 0.79},
-		{ID: "glm-5.2", DisplayName: "GLM-5.2", CostFactor: 0.50},
-		{ID: "glm-5.3", DisplayName: "GLM-5.3", CostFactor: 0.79},
-		{ID: "glm-5.3-flash", DisplayName: "GLM-5.3-Flash", CostFactor: 0.06},
-		{ID: "glm-5v-turbo", DisplayName: "GLM-5v-Turbo", CostFactor: 0.71},
-		{ID: "kimi-k2.6", DisplayName: "Kimi-K2.6", CostFactor: 0.52},
-		{ID: "kimi-k2.7", DisplayName: "Kimi-K2.7", CostFactor: 0.57},
-		{ID: "kimi-k3", DisplayName: "Kimi-K3", CostFactor: 1.62},
-		{ID: "minimax-m3", DisplayName: "MiniMax-M3", CostFactor: 0.25},
+		{ID: "glm-5.1", DisplayName: "GLM-5.1", Credits: 0.79, HasCredits: true},
+		{ID: "glm-5.2", DisplayName: "GLM-5.2", Credits: 0.50, HasCredits: true},
+		{ID: "glm-5.3", DisplayName: "GLM-5.3", Credits: 0.79, HasCredits: true},
+		{ID: "glm-5.3-flash", DisplayName: "GLM-5.3-Flash", Credits: 0.06, HasCredits: true},
+		{ID: "glm-5v-turbo", DisplayName: "GLM-5v-Turbo", Credits: 0.71, HasCredits: true},
+		{ID: "kimi-k2.6", DisplayName: "Kimi-K2.6", Credits: 0.52, HasCredits: true},
+		{ID: "kimi-k2.7", DisplayName: "Kimi-K2.7", Credits: 0.57, HasCredits: true},
+		{ID: "kimi-k3", DisplayName: "Kimi-K3", Credits: 1.62, HasCredits: true},
+		{ID: "minimax-m3", DisplayName: "MiniMax-M3", Credits: 0.25, HasCredits: true},
 	}
 }
 

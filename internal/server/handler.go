@@ -335,8 +335,18 @@ func (h *Handler) modelEntries(ms []upstream.Model) []map[string]any {
 		if m.ContextLen > 0 {
 			entry["context_length"] = m.ContextLen
 		}
+		// 倍率：**只在真有值时给**，并用 credits/has_credits 这一对。
+		//
+		// 不能写 `if m.Credits != 0`：0.00 是合法值（实测 hy3 = "x0.00"，
+		// 不消耗额度），那样会把这种 0 当成「没有」，界面上显示成「—」。
+		// 也不能沿用 cost_factor 那个字段名 —— 上游现在的字段叫 credits，
+		// 语义是 CodeBuddy 自己的额度倍数，与 Qoder 的 price_factor 不同体系，
+		// 沿用旧名会让前端以为还是同一个东西（前端已拆成各自的列）。
+		if m.HasCredits {
+			entry["credits"] = m.Credits
+		}
 		if m.CostFactor != 0 {
-			entry["cost_factor"] = m.CostFactor
+			entry["cost_factor"] = m.CostFactor // 旧字段，仅兜底表可能带
 		}
 		data = append(data, entry)
 	}
@@ -428,7 +438,13 @@ func (h *Handler) apiModelsManage(w http.ResponseWriter, r *http.Request) {
 			"reasoning":      m.Reasoning,
 			"vision":         m.Vision,
 			"context_length": m.ContextLen,
-			"cost_factor":    m.CostFactor,
+		}
+		// 倍率只在真有值时给（0.00 是合法值，见所有模型接口那处的说明）。
+		if m.HasCredits {
+			item["credits"] = m.Credits
+		}
+		if m.CostFactor != 0 {
+			item["cost_factor"] = m.CostFactor // 旧字段，仅兜底表可能带
 		}
 		// 默认禁用（国际域独有）的额外标出来：界面上要能解释
 		// 「为什么这个模型默认是关的」，并让用户知道可以开。

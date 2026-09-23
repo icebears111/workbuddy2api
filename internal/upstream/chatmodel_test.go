@@ -109,3 +109,56 @@ func TestFilterChatModels(t *testing.T) {
 		t.Fatalf("过滤后 = %v, want 只有 glm-5.3 与 deepseek-v4.1-flash", got)
 	}
 }
+
+// credits 是**字符串** "x0.21"，不是数字 —— 这是本轮踩到的点。
+//
+// 原来前端认的是 cost_factor（数字），而上游早已改成 credits（带 x 前缀的
+// 字符串），于是那个「倍率」列对 buddy 全空。这个测试钉住解析规则。
+func TestCreditMultiplier(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+		ok   bool
+	}{
+		{"x0.21", 0.21, true},
+		{"x1.20", 1.20, true},
+		{"x2.00", 2.00, true},
+		{"x0.00", 0, true}, // ★ 0 是合法值（hy3 不消耗额度），不能被当成「没有」
+		{"0.5", 0.5, true}, // 没有 x 前缀也能解
+		{"X0.3", 0.3, true},
+		{" x0.4 ", 0.4, true},
+		{"", 0, false},
+		{"x", 0, false},
+		{"abc", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := CreditMultiplier(c.in)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("CreditMultiplier(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// modelFromMap 要从上游条目里解析出 credits（含 0.00 的 has 标记）。
+func TestModelFromMapParsesCredits(t *testing.T) {
+	m := map[string]any{"id": "glm-5.3", "name": "GLM-5.3", "credits": "x0.79"}
+	got := modelFromMap(m)
+	if got == nil {
+		t.Fatal("解析失败")
+	}
+	if !got.HasCredits || got.Credits != 0.79 {
+		t.Fatalf("credits 解析错：has=%v val=%v", got.HasCredits, got.Credits)
+	}
+
+	// 0.00 必须也标 has=true —— 否则界面上那个合法的 0 会显示成「—」
+	zero := modelFromMap(map[string]any{"id": "hy3", "credits": "x0.00"})
+	if !zero.HasCredits || zero.Credits != 0 {
+		t.Fatalf("credits=0.00 应标 has=true，得到 has=%v val=%v", zero.HasCredits, zero.Credits)
+	}
+
+	// 没有这个字段 → has=false（与「值是 0」区分开）
+	none := modelFromMap(map[string]any{"id": "deepseek-v3"})
+	if none.HasCredits {
+		t.Fatal("上游没给 credits 时 HasCredits 应为 false")
+	}
+}
