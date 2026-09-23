@@ -165,9 +165,11 @@ func main() {
 		Realms: map[string]server.RealmConfig{
 			// CN 控制台域（ck_ Key），沿用全局上游。
 			"cn": {
-				Base:        cfg.Upstream.Base,
-				ChatPath:    upstream.ChatPath,
-				ModelsPaths: []string{upstream.ModelsPathV2, upstream.ConfigPathV3},
+				Base:     cfg.Upstream.Base,
+				ChatPath: upstream.ChatPath,
+				// /v3/config **放前面**：/v2/models 已被上游下线（恒 404），
+				// 放前面的话每次刷新都白跑一趟。
+				ModelsPaths: []string{upstream.ConfigPathV3},
 				Headers:     nil,
 			},
 			// SaaS 域（OAuth 登录所得 token），走 www.codebuddy.ai。
@@ -175,7 +177,7 @@ func main() {
 			"saas": {
 				Base:        "https://www.codebuddy.ai",
 				ChatPath:    "/v2/chat/completions",
-				ModelsPaths: []string{"/v2/models", upstream.ConfigPathV3},
+				ModelsPaths: []string{upstream.ConfigPathV3},
 				Headers: map[string]string{
 					"X-Domain":       "www.codebuddy.ai",
 					"X-Product":      "SaaS",
@@ -189,6 +191,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 预热模型清单：异步拉一次，免得进程起来后第一个 /v1/models
+	// 请求走「完全没值 → 同步拉」那条路白等（见 WarmModels 的说明）。
+	h.WarmModels()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

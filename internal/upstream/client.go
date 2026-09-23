@@ -24,10 +24,41 @@ const (
 	// ChatPath 对话端点（拼在 Base 后）。
 	ChatPath = "/v2/chat/completions"
 	// ModelsPathV2 OpenAI 风格模型列表。
+	//
+	// ⚠ 2026-09-23 实测：上游**已下线此路由**（恒返回
+	// `{"error_msg":"404 Route Not Found"}`）。保留常量只为兼容旧配置，
+	// 新代码不要再把它当第一优先路径 —— 它会白跑一趟。
 	ModelsPathV2 = "/v2/models"
-	// ConfigPathV3 CodeBuddy 配置端点，匿名访问时 data.models 为空，带凭证才返回模型。
+	// ConfigPathV3 CodeBuddy 配置端点 —— 现在是**唯一**能拿到模型清单的路径。
+	//
+	// 两个前提（都实测过，缺一不可）：
+	//  1. 带凭证：匿名访问时 data.models 为 null；
+	//  2. **带官方 UA**：见 ModelsUserAgent。
+	//     不带 UA 时 data 里根本没有 models 字段（只有 enterpriseId /
+	//     productFeatures 几个键），看起来像"上游不提供模型了"。
 	ConfigPathV3 = "/v3/config"
 )
+
+// ModelsUserAgent 拉模型清单时必须带的 User-Agent。
+//
+// ── 为什么需要它（2026-09-23 实测 + 交叉验证 agent2api）──
+// 上游按 UA 识别客户端通道，**UA 里有没有 `CLI/<版本>` 段**决定返回哪一档清单。
+// 实测同一个账号打 /v3/config：
+//
+//	不带 UA（桥原来的行为）                       → data 里没有 models 字段
+//	"CodeBuddy/1.0"                              → 同上
+//	"WorkBuddy/5.5.4 WorkBuddy/5.5.4"            → 37 个（旧版兼容清单）
+//	"WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"→ **51 个（完整清单）**
+//
+// 这一点与开源实现 agent2api 的结论一致（desktop-tauri/src-tauri/
+// src/server/core/endpoints.rs 的 user_agent_for_edition + 注释：
+// "服务端按该段识别桌面 CLI 通道：缺失时 /v3/config 只下发旧版兼容模型清单
+// （37 个，无 v4.1/5.3/hy4/modelPromotions），带上才下发完整清单（51 个）"）。
+//
+// 版本号取 agent2api 里同一组值（客户端 5.5.4 / CLI 2.137.1）。
+// 上游将来升版本时这个串会过期 —— 但那只会让清单退回 37 个的兼容档，
+// 不会让接口失败，所以按「够用就好」维护，不必追着官方版本跑。
+const ModelsUserAgent = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
 
 // Client 上游业务 API 客户端。
 type Client struct {
@@ -246,6 +277,30 @@ func (c *Client) FetchResource(ctx context.Context, base, token string, hdr map[
 	return &info, nil
 }
 
+// UserAgent 所有上游请求共用的 User-Agent。
+//
+// ── 为什么是这一串（2026-09-23 实测）──
+// 上游按 UA 里有没有 **`CLI/<版本>` 段**、以及版本新旧，决定下发哪一档模型清单。
+// 同一个账号打 /v3/config，实测：
+//
+//	不带 UA                                        → data 里没有 models 字段
+//	"Coding Copilot/1.106.1 CodeBuddy/1.106.1"     → 同上（**桥原来的值**）
+//	"WorkBuddy/5.5.4 WorkBuddy/5.5.4"              → 37 个（旧版兼容清单）
+//	"WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"  → **51 个（完整清单）**
+//
+// 注意老 UA 不是"被拒绝"（那会是 4xx/业务码），而是被当成旧客户端、
+// **直接不给 models 字段** —— 表现得像"上游不再提供模型列表"，
+// 实际只是版本号太旧。这就是这个 bug 藏了这么久的原因。
+//
+// 这一串与开源实现 agent2api 一致（desktop-tauri/src-tauri/src/server/core/
+// endpoints.rs 的 user_agent_for_edition 产出同形）。它的注释同样写着：
+// 「服务端按该段识别桌面 CLI 通道：缺失时 /v3/config 只下发旧版兼容模型清单
+// （37 个，无 v4.1/5.3/hy4/modelPromotions），带上才下发完整清单（51 个）」。
+//
+// 过期风险：上游升版本后这一串会变旧，症状是清单变少或消失，**不会报错**。
+// 所以刷新成功后要把条数打进日志，便于发现"从 51 掉到 37"这类退化。
+const UserAgent = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+
 // applyAuth 设置认证头：Bearer 必带；X-Api-Key 仅 ck_ 静态 Key 才双写
 // （OAuth 得到的 JWT 不应带 X-Api-Key，否则 SaaS 域可能拒绝）。
 func applyAuth(req *http.Request, token string, body []byte) {
@@ -256,10 +311,8 @@ func applyAuth(req *http.Request, token string, body []byte) {
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
-	// 上游 /v3/config 等端点会校验 User-Agent 中的 “Coding Copilot” 版本号，
-	// 缺失或无法解析会返回 12403 "check ua, get coding copilot version error"。
-	// 因此必须带真实客户端形态的 UA（与已安装 CodeBuddy CN 1.106.1 对齐）。
-	req.Header.Set("User-Agent", "Coding Copilot/1.106.1 CodeBuddy/1.106.1")
+	// 见 UserAgent 的说明：这一串决定上游给哪一档模型清单。
+	req.Header.Set("User-Agent", UserAgent)
 	_ = body
 }
 
@@ -324,7 +377,7 @@ func dumpUpstreamRequest(method, fullURL, token string, payload []byte, hdr map[
 		hdrLines = append(hdrLines, k+": "+v)
 	}
 	// 从 applyAuth 复制出的固定头（与 doReq 一致）
-	hdrLines = append(hdrLines, "Accept: text/event-stream", "Content-Type: application/json", "Accept-Encoding: identity", "User-Agent: Coding Copilot/1.106.1 CodeBuddy/1.106.1")
+	hdrLines = append(hdrLines, "Accept: text/event-stream", "Content-Type: application/json", "Accept-Encoding: identity", "User-Agent: "+UserAgent)
 
 	out := strings.Builder{}
 	out.WriteString("=== upstream request dump ===\n")

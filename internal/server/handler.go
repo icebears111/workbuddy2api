@@ -153,6 +153,9 @@ type Handler struct {
 	// 兜底结果同样要缓存，但用**更短的 TTL**（modelsFallbackTTL）：
 	// 上游可能马上恢复，不能像成功结果那样缓存一小时。
 	modelsFallback bool
+	// modelsRefreshMu 保证同一时刻只有一个后台刷新在跑（TryLock，
+	// 拿不到就跳过 —— 已经在刷了，没必要排队）。见 refreshModelsAsync。
+	modelsRefreshMu sync.Mutex
 
 	// quotaAll 缓存：上游 4 个计费接口串行约 2.5s/账号，额度页 60s 轮询
 	// 会持续打满上游。缓存 45s TTL，刷新期间并发请求共享同一次拉取。
@@ -531,16 +534,69 @@ func (h *Handler) modelsFreshLocked() ([]upstream.Model, bool) {
 	return h.models, true
 }
 
+// WarmModels 启动时预热模型清单（异步、不阻塞启动）。
+//
+// 为什么要有它：/v1/models 的刷新是「过期才拉、且不阻塞请求」的
+// （见 allModels）。若不预热，进程起来后的**第一个**请求会走
+// 「完全没值 → 同步拉」那条路，白等约 400ms。
+// 启动时先拉一次，把这段时间挪到没人等的时候。
+//
+// 失败不报错：拉不到就走兜底表，下次请求会按短 TTL 重试。
+func (h *Handler) WarmModels() {
+	go h.fetchAndStoreModels()
+}
+
 // allModels 完整清单，**不过滤禁用**。看板的管理页必须用它 ——
 // 过滤掉的话被禁用的模型从页面消失，用户再也找不到开关恢复它。
+//
+// ── 刷新策略（2026-09-23 改为不阻塞）──
+// 缓存过期时**不在这里同步拉**，而是返回手上的旧清单 + 触发一次后台刷新。
+// 理由：拉清单要串行打上游（每个候选账号一次 /v3/config），实测约 400ms；
+// 而 /v1/models 是看板每次刷新都会调的接口，同步拉等于每轮刷新白等。
+// 与 agent2api 的做法一致（它也是启动时/每次 GET /v1/models 触发**异步**刷新）。
+//
+// 三种情形：
+//   - 新鲜        → 直接返回缓存
+//   - 过期但有旧值 → **立即返回旧值**，同时后台刷新（用户不会等）
+//   - 完全没值     → 只能同步拉一次（首屏必须给东西），但会打日志
 func (h *Handler) allModels() []upstream.Model {
 	h.modelsMu.RLock()
 	if ms, ok := h.modelsFreshLocked(); ok {
 		h.modelsMu.RUnlock()
 		return ms
 	}
+	stale := h.models // 可能为空
 	h.modelsMu.RUnlock()
 
+	if len(stale) > 0 {
+		// 有旧值：先给出去，后台补新的
+		h.refreshModelsAsync()
+		return stale
+	}
+
+	// 一点都没有（进程刚起或首次失败）：同步拉一次，
+	// 否则 /v1/models 只能回空清单 —— 那对客户端是更差的体验。
+	return h.fetchAndStoreModels()
+}
+
+// refreshModelsAsync 触发一次后台刷新，同时只允许一个在跑。
+//
+// 用 TryLock 而不是 Lock：拿不到锁说明已经有一个在刷，
+// **直接放弃**即可（那个刷完缓存就新了）—— 不能在这里排队等，
+// 否则并发请求会把线程堆在锁上。
+func (h *Handler) refreshModelsAsync() {
+	if !h.modelsRefreshMu.TryLock() {
+		return
+	}
+	go func() {
+		defer h.modelsRefreshMu.Unlock()
+		h.fetchAndStoreModels()
+	}()
+}
+
+// fetchAndStoreModels 同步拉一次模型清单并写缓存（含兜底），返回结果。
+// 这是唯一真正打上游的路径，由 allModels（首屏）与 refreshModelsAsync 调用。
+func (h *Handler) fetchAndStoreModels() []upstream.Model {
 	// 模型表按账号逐个尝试（最多 MaxRotate 个 healthy 号），取第一个非空结果。
 	// 不能只 Pick() 一个号：临期优先会长期钉在最早到期号上，若该号上游
 	// 模型列表为空（不同账号套餐/订阅可见模型不同），模型表会一直拿不到。

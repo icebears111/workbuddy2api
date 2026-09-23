@@ -98,14 +98,21 @@ func TestFallbackCacheExpiresQuickly(t *testing.T) {
 	h.fetchedAt = time.Now().Add(-modelsFallbackTTL - time.Second)
 	h.modelsMu.Unlock()
 
+	// TTL 过期后：请求**立即拿到旧值**（不阻塞），刷新在后台跑。
 	_ = do(t, h, "GET", "/v1/models", "sk-global", "")
+	// 等后台刷新落地（异步，所以轮询而不是立即断言）
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt64(&hits) < 2*modelPathsPerAttempt && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if got := atomic.LoadInt64(&hits); got != 2*modelPathsPerAttempt {
-		t.Fatalf("TTL 过期后上游请求数 = %d, want %d（兜底缓存没按短 TTL 过期）",
+		t.Fatalf("TTL 过期后上游请求数 = %d, want %d（后台刷新没触发）",
 			got, 2*modelPathsPerAttempt)
 	}
 
 	// 而未过期时不该再打
 	_ = do(t, h, "GET", "/v1/models", "sk-global", "")
+	time.Sleep(50 * time.Millisecond)
 	if got := atomic.LoadInt64(&hits); got != 2*modelPathsPerAttempt {
 		t.Fatalf("TTL 内又打了上游（共 %d 次），缓存没生效", got)
 	}
@@ -158,4 +165,59 @@ func containsStr(s, sub string) bool {
 		}
 		return false
 	})()
+}
+
+// ★ 核心契约 ★：缓存过期时，请求**不能等**上游。
+//
+// 2026-09-23 的改动要点：拉清单要串行打上游（实测约 400ms），
+// 而 /v1/models 是看板每次刷新都调的接口 —— 同步拉等于每轮刷新白等。
+// 所以有旧值时立即返回旧值，刷新丢到后台。
+//
+// 这个测试用「上游故意睡 1 秒」来放大差异：若实现是同步的，
+// 请求耗时就接近 1 秒；不阻塞的话应当在几十毫秒内返回。
+func TestStaleModelsReturnImmediately(t *testing.T) {
+	var hits int64
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt64(&hits, 1)
+		// 第一次立刻回（让缓存先有值），之后的刷新卡住 1 秒
+		if n > 1 {
+			select {
+			case <-release:
+			case <-time.After(time.Second):
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"glm-5.3","maxOutputTokens":24000}]}`))
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	p := pool.New("")
+	p.Add(&cred.Cred{UID: "acct-1", Nickname: "acct-1", Token: "ck_test", Kind: cred.KindAPIKey})
+	h := NewHandler(Config{
+		Pool: p, Upstream: upstream.NewWithBase(srv.URL),
+		APIKey: "sk-global", MaxRotate: 1,
+	})
+
+	// 首次：拿到清单
+	_ = do(t, h, "GET", "/v1/models", "sk-global", "")
+	// 把缓存拨到过期
+	h.modelsMu.Lock()
+	h.fetchedAt = time.Now().Add(-modelsTTL - time.Second)
+	h.modelsMu.Unlock()
+
+	// 过期后请求：必须立刻返回（不能等上游那 1 秒）
+	t0 := time.Now()
+	w := do(t, h, "GET", "/v1/models", "sk-global", "")
+	elapsed := time.Since(t0)
+	if w.Code != http.StatusOK {
+		t.Fatalf("过期后 /v1/models = %d", w.Code)
+	}
+	if !containsStr(w.Body.String(), "glm-5.3") {
+		t.Fatalf("过期时应返回旧清单，得到 %s", w.Body.String()[:150])
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("过期后请求耗时 %v —— 像是同步等上游了（应当立即返回旧值）", elapsed)
+	}
 }

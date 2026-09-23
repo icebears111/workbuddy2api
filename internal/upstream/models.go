@@ -68,7 +68,71 @@ func (c *Client) fetchPathBase(ctx context.Context, base, path, token string, hd
 	if len(ms) == 0 {
 		return nil, fmt.Errorf("models %s: empty", path)
 	}
+	// /v3/config 给的是**混合目录**（对话 + 补全 + 图像 + 小参数试验），
+	// 实测 51 个里只有 33 个能用于 /v1/chat/completions。只对这一条路径做
+	// 准入过滤 —— 其它形状（OpenAI 风格 /v2/models）本来就是纯对话清单，
+	// 而且不一定带 maxOutputTokens，用它当判据会把正常模型全滤掉。
+	if path == ConfigPathV3 {
+		chat := filterChatModels(raw, ms)
+		if len(chat) == 0 {
+			// 一条都没剩 → 按「拿不到清单」处理（上层会走兜底），
+			// 而不是返回空清单：空清单会让「缓存只在非空时写」的逻辑失效。
+			return nil, fmt.Errorf("models %s: 0 chat models after filter (upstream gave %d)", path, len(ms))
+		}
+		return chat, nil
+	}
 	return ms, nil
+}
+
+// filterChatModels 从已解析的清单里剔除非对话模型。
+//
+// 必须回原始 JSON 再判一次：IsChatModel 要看 maxOutputTokens 与
+// supportsExtra，而 Model 结构体不搬这两个字段（它们只用于准入判断）。
+// 用 id 把两边对齐 —— parseModelList 已按 NormalizeModelName 归一，
+// 这里对原目录项做同样的归一，才能对上。
+func filterChatModels(raw []byte, parsed []Model) []Model {
+	allow := map[string]bool{}
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case []any:
+			for _, it := range t {
+				if m, ok := it.(map[string]any); ok {
+					if IsChatModel(m) {
+						if id := pickString(m, "id", "model", "key", "name", "model_id", "modelId"); id != "" {
+							allow[NormalizeModelName(id)] = true
+						}
+					}
+				}
+			}
+		case map[string]any:
+			for _, vv := range t {
+				walk(vv)
+			}
+		}
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		if d, ok := probe["data"]; ok {
+			var dv any
+			if json.Unmarshal(d, &dv) == nil {
+				walk(dv)
+			}
+		}
+	}
+	if len(allow) == 0 {
+		var arr any
+		if json.Unmarshal(raw, &arr) == nil {
+			walk(arr)
+		}
+	}
+	out := make([]Model, 0, len(parsed))
+	for _, m := range parsed {
+		if allow[m.ID] {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // parseModelList 宽松解析：兼容
@@ -86,6 +150,11 @@ func parseModelList(raw []byte) []Model {
 			if !ok {
 				continue
 			}
+			// 准入过滤（非对话模型剔除）见 parseModelListChatOnly ——
+			// 这里**不做**：本函数是纯形状解析，要能被单测独立验证，
+			// 也不该假设每个上游都带 maxOutputTokens（那是 CodeBuddy
+			// 目录专有的字段）。判据必须在这一层做的话就会伤到
+			// 其它形状的解析（实测：加了之后 TestParseModelList 全挂）。
 			if mm := modelFromMap(m); mm != nil && !seen[mm.ID] {
 				seen[mm.ID] = true
 				out = append(out, *mm)
@@ -287,5 +356,75 @@ func FallbackModels() []Model {
 		{ID: "kimi-k2.7", DisplayName: "Kimi-K2.7", CostFactor: 0.57},
 		{ID: "kimi-k3", DisplayName: "Kimi-K3", CostFactor: 1.62},
 		{ID: "minimax-m3", DisplayName: "MiniMax-M3", CostFactor: 0.25},
+	}
+}
+
+// ── 对话模型过滤（2026-09-23）────────────────────────────────
+//
+// 上游 /v3/config 返回的是一份**混合目录**：除了对话模型，还有代码补全
+// （codewise-*）、补全基座（completion-*）、图像模型（hunyuan-image*）、
+// 小参数试验模型（hunyuan-3b/7b）等。实测 51 个里只有 33 个是能用于
+// /v1/chat/completions 的对话模型。
+//
+// 直接把 51 个透出去，客户端的下拉框里会出现 codewise-completions 这种
+// 选了也没法聊天的项。所以按下面三条过滤。
+//
+// 规则**照抄 agent2api**（core/models/mod.rs 的 is_chat_model），
+// 不自创 —— 它是在真实目录上迭代出来的，包括 maxOutputTokens>=16000 那条
+// 经验值（实测把 hunyuan-chat 排除掉了，那个只支持 8192 输出）。
+//
+// 排除前缀（agent2api 同名常量 CHAT_MODEL_EXCLUDE_PREFIXES）
+var chatModelExcludePrefixes = []string{
+	"completion-",
+	"codewise-",
+	"hunyuan-image",
+	"hunyuan-3b",
+	"hunyuan-7b",
+	"deepseek-r1-0528",
+	"deepseek-v3-0324",
+	"kimi-k2-instruct",
+	"default-1.",
+}
+
+// IsChatModel 判断一条目录项是否可用于对话。
+//
+// 三条规则（全部满足才算对话模型）：
+//  1. id 不以排除前缀开头；
+//  2. 没有 supportsExtra 真值（那是补全类的附加通道）；
+//  3. maxOutputTokens 存在且 >= 16000。
+//
+// 第 3 条最容易被忽略：**缺字段也算不合格**（不是"没限制"）——
+// 上游对非对话项压根不给这个字段。
+func IsChatModel(m map[string]any) bool {
+	id := pickString(m, "id", "model", "key", "name", "model_id", "modelId")
+	for _, p := range chatModelExcludePrefixes {
+		if strings.HasPrefix(id, p) {
+			return false
+		}
+	}
+	if v, ok := m["supportsExtra"]; ok && jsTruthy(v) {
+		return false
+	}
+	mo := pickInt(m, "maxOutputTokens", "max_output_tokens")
+	return mo >= 16000
+}
+
+// jsTruthy 对应 JS 的真值判定（agent2api 用 js_truthy，语义要对齐：
+// 非零数字、非空字符串、true 都算真）。
+func jsTruthy(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case float64:
+		return t != 0
+	case json.Number:
+		f, err := t.Float64()
+		return err == nil && f != 0
+	case string:
+		return strings.TrimSpace(t) != ""
+	case nil:
+		return false
+	default:
+		return true
 	}
 }
