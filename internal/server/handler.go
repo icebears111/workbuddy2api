@@ -117,9 +117,16 @@ func cnBaseHeaders(c *cred.Cred) map[string]string {
 
 // storeModels 写入全局模型缓存（供 /v1/models 返回）。
 func (h *Handler) storeModels(ms []upstream.Model) {
+	h.setModels(ms, false)
+}
+
+// setModels 写缓存。fallback 为真表示这是「上游拉空后的兜底表」，
+// 会用较短的 TTL 过期（见 modelsFallbackTTL）—— 上游一恢复就该重试。
+func (h *Handler) setModels(ms []upstream.Model, fallback bool) {
 	h.modelsMu.Lock()
 	h.models = ms
 	h.fetchedAt = time.Now()
+	h.modelsFallback = fallback
 	h.modelsSeen = map[string]bool{}
 	for _, m := range ms {
 		h.modelsSeen[m.ID] = true
@@ -136,6 +143,16 @@ type Handler struct {
 	models     []upstream.Model
 	modelsSeen map[string]bool
 	fetchedAt  time.Time
+	// modelsFallback 标记「上次是失败兜底」。
+	//
+	// 2026-09-22 修：原来缓存**只在成功时写**，所以上游返回空时
+	// （实测本网关就是这样：`models /v3/config: empty`）每次请求都要
+	// 重新轮 3 个账号、每个 ~160ms → **单次 /v1/models 约 500ms**。
+	// 而看板每次刷新都会调它，于是页面整体变慢。
+	//
+	// 兜底结果同样要缓存，但用**更短的 TTL**（modelsFallbackTTL）：
+	// 上游可能马上恢复，不能像成功结果那样缓存一小时。
+	modelsFallback bool
 
 	// quotaAll 缓存：上游 4 个计费接口串行约 2.5s/账号，额度页 60s 轮询
 	// 会持续打满上游。缓存 45s TTL，刷新期间并发请求共享同一次拉取。
@@ -493,12 +510,32 @@ func (h *Handler) effectiveModels() []upstream.Model {
 	return out
 }
 
+const modelsFallbackTTL = 2 * time.Minute
+
+// modelsFreshLocked 判断缓存是否还新鲜，新鲜则返回它（调用方需持读锁）。
+//
+// 成功结果缓存 modelsTTL（1 小时）；**兜底结果只缓存
+// modelsFallbackTTL（2 分钟）** —— 兜底意味着上游此刻拉不到，
+// 但可能马上恢复，压一小时就再也不会重试了。
+func (h *Handler) modelsFreshLocked() ([]upstream.Model, bool) {
+	if len(h.models) == 0 {
+		return nil, false
+	}
+	ttl := modelsTTL
+	if h.modelsFallback {
+		ttl = modelsFallbackTTL
+	}
+	if time.Since(h.fetchedAt) >= ttl {
+		return nil, false
+	}
+	return h.models, true
+}
+
 // allModels 完整清单，**不过滤禁用**。看板的管理页必须用它 ——
 // 过滤掉的话被禁用的模型从页面消失，用户再也找不到开关恢复它。
 func (h *Handler) allModels() []upstream.Model {
 	h.modelsMu.RLock()
-	if len(h.models) > 0 && time.Since(h.fetchedAt) < modelsTTL {
-		ms := h.models
+	if ms, ok := h.modelsFreshLocked(); ok {
 		h.modelsMu.RUnlock()
 		return ms
 	}
@@ -531,21 +568,22 @@ func (h *Handler) allModels() []upstream.Model {
 			continue
 		}
 		// 成功拉到非空模型表：缓存并返回
-		h.modelsMu.Lock()
-		h.models = ms
-		h.fetchedAt = time.Now()
-		h.modelsSeen = map[string]bool{}
-		for _, m := range ms {
-			h.modelsSeen[m.ID] = true
-		}
-		h.modelsMu.Unlock()
+		h.setModels(ms, false)
 		return ms
 	}
-	// 所有 healthy 号都拉空/失败 → 用兜底模型表
+	// 所有 healthy 号都拉空/失败 → 用兜底模型表。
+	//
+	// **兜底也要写缓存**（2026-09-22 修）：原来这里直接 return，
+	// 缓存仍是空的，于是下一个请求又把上面整个循环重跑一遍 ——
+	// 上游持续返回空时（实测本网关就是），每次 /v1/models 都白等约 500ms，
+	// 而看板每次刷新都调它，页面因此明显变慢。
+	// 用较短的 TTL（modelsFallbackTTL）缓存，兼顾「别白等」与「上游恢复后要能重试」。
 	if lastErr != nil {
 		log.Printf("models: all accounts fetch failed (%v), using fallback table", lastErr)
 	}
-	return upstream.FallbackModels()
+	fb := upstream.FallbackModels()
+	h.setModels(fb, true)
+	return fb
 }
 
 type chatRequest struct {
