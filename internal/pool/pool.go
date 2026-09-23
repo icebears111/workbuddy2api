@@ -597,3 +597,91 @@ func (p *Pool) Owners() []OwnerSummary {
 	sort.Slice(out, func(i, j int) bool { return out[i].Owner < out[j].Owner })
 	return out
 }
+
+// PickRealm 挑一个指定 realm 的可用账号；tried 用于跳过已试过的。
+//
+// 与 PickAny 的区别只有 realm 过滤。为什么要它：
+// 上游按账号所属域下发**不同的模型目录**（实测 CN 账号给混元/DeepSeek/GLM，
+// SaaS 账号给 GPT/Gemini），而模型清单要按域分别拉取再合并
+// —— 只 PickAny 会让清单取决于「恰好挑中哪个账号」，随健康状态跳变。
+//
+// realm 传空字符串表示「无 realm」（用全局上游的旧式凭证）。
+// allowEmpty 为真时，realm=="" 的账号也算匹配（老凭证没有 realm 字段）。
+func (p *Pool) PickRealm(realm string, tried map[string]bool, allowEmpty bool) *cred.Cred {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var best *entry
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue
+		}
+		if e.c == nil || !e.healthy(now) {
+			continue
+		}
+		r := e.c.Realm
+		if r != realm && !(allowEmpty && r == "") {
+			continue
+		}
+		if best == nil || pickPrefer(e, best) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	best.lastUsed = now
+	p.seq++
+	best.seq = p.seq
+	return best.c
+}
+
+// Realms 当前池里出现过哪些 realm（去重、排序）。
+//
+// 给模型清单用：要按域分别拉目录，就得先知道有哪些域。
+// 空字符串（无 realm 的老凭证）会作为 "" 返回。
+func (p *Pool) Realms() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := map[string]bool{}
+	for _, e := range p.byUID {
+		if e.c == nil {
+			continue
+		}
+		seen[e.c.Realm] = true
+	}
+	out := make([]string, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ListAllWithRealm 在 ListAll 的基础上带上 realm —— 看板要标注
+// 「这个账号属于哪个域」（模型清单按域过滤后，用户能看懂为什么少了模型）。
+func (p *Pool) ListAllWithRealm() []RealmStatus {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	out := make([]RealmStatus, 0, len(uids))
+	for _, uid := range uids {
+		e := p.byUID[uid]
+		realm := ""
+		if e.c != nil {
+			realm = e.c.Realm
+		}
+		out = append(out, RealmStatus{Status: p.statusOf(uid, e), Realm: realm})
+	}
+	return out
+}
+
+// RealmStatus Status + 所属域。
+type RealmStatus struct {
+	Status
+	Realm string `json:"realm,omitempty"`
+}

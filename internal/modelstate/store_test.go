@@ -104,8 +104,9 @@ func TestPersistAcrossReload(t *testing.T) {
 	if err := json.Unmarshal(raw, &shape); err != nil {
 		t.Fatalf("persisted file must be valid json: %v", err)
 	}
-	if shape.Version != 1 {
-		t.Errorf("want version 1, got %d", shape.Version)
+	// Version 2 = 加了 enabled 一档（2026-09-23：默认禁用的模型要能被显式开启）
+	if shape.Version != 2 {
+		t.Errorf("want version 2, got %d", shape.Version)
 	}
 }
 

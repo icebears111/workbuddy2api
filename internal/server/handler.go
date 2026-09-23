@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -156,6 +157,12 @@ type Handler struct {
 	// modelsRefreshMu 保证同一时刻只有一个后台刷新在跑（TryLock，
 	// 拿不到就跳过 —— 已经在刷了，没必要排队）。见 refreshModelsAsync。
 	modelsRefreshMu sync.Mutex
+	// modelsByRealm 上次各域各自拿到的模型 id 集合（realm → set）。
+	//
+	// 为什么要留存分域结果：清单是并集，但**「哪些只在国际域有」**这个信息
+	// 只有分域看才知道。模型页要据此把这些默认禁用（国内账号服务不了它们，
+	// 列出来只会让人点名请求然后失败）。
+	modelsByRealm map[string]map[string]bool
 
 	// quotaAll 缓存：上游 4 个计费接口串行约 2.5s/账号，额度页 60s 轮询
 	// 会持续打满上游。缓存 45s TTL，刷新期间并发请求共享同一次拉取。
@@ -336,9 +343,22 @@ func (h *Handler) modelEntries(ms []upstream.Model) []map[string]any {
 	return data
 }
 
-// modelDisabled 该模型是否被看板禁用（大小写不敏感；ModelState 为 nil 时恒 false）。
+// modelDisabled 该模型是否**最终**处于禁用状态。
+//
+// 两道来源合成（优先级见 modelstate.Resolve）：
+//  1. 「默认禁用」——只在国际域可见的模型（国内账号服务不了，见
+//     defaultDisabledModel）。这是**默认值**，用户可以覆盖。
+//  2. 用户在看板上的显式选择 —— 永远压过默认值。
+//
+// 全部调用点（清单过滤 / 请求拦截 / 管理接口）都走这一个函数，
+// 避免"清单里藏了但请求还能打进来"这类不一致。
+// ModelState 为 nil 时只剩默认值判定（没装存储也能正常工作）。
 func (h *Handler) modelDisabled(id string) bool {
-	return h.cfg.ModelState != nil && h.cfg.ModelState.IsDisabled(id)
+	def := h.defaultDisabledModel(id)
+	if h.cfg.ModelState == nil {
+		return def
+	}
+	return h.cfg.ModelState.Resolve(id, def)
 }
 
 // rejectDisabledModel 请求侧拦截：模型被禁用时写错误并返回 true。
@@ -395,26 +415,33 @@ func (h *Handler) apiUsageStats(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiModelsManage(w http.ResponseWriter, r *http.Request) {
 	ms := h.allModels()
 	out := make([]map[string]any, 0, len(ms))
+	disabled := 0
 	for _, m := range ms {
-		out = append(out, map[string]any{
+		off := h.modelDisabled(m.ID)
+		if off {
+			disabled++
+		}
+		item := map[string]any{
 			"id":             m.ID,
 			"display_name":   m.DisplayName,
-			"enabled":        !h.modelDisabled(m.ID),
+			"enabled":        !off,
 			"reasoning":      m.Reasoning,
 			"vision":         m.Vision,
 			"context_length": m.ContextLen,
 			"cost_factor":    m.CostFactor,
-		})
+		}
+		// 默认禁用（国际域独有）的额外标出来：界面上要能解释
+		// 「为什么这个模型默认是关的」，并让用户知道可以开。
+		if h.defaultDisabledModel(m.ID) {
+			item["default_disabled"] = true
+			item["default_disabled_reason"] = "仅国际域可见，国内账号无法服务；可在本页手动开启"
+		}
+		out = append(out, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"models": out,
-		"count":  len(out),
-		"disabled_count": func() int {
-			if h.cfg.ModelState == nil {
-				return 0
-			}
-			return h.cfg.ModelState.Count()
-		}(),
+		"models":         out,
+		"count":          len(out),
+		"disabled_count": disabled,
 	})
 }
 
@@ -594,16 +621,133 @@ func (h *Handler) refreshModelsAsync() {
 	}()
 }
 
-// fetchAndStoreModels 同步拉一次模型清单并写缓存（含兜底），返回结果。
+// fetchAndStoreModels 拉一次模型清单并写缓存（含兜底），返回结果。
 // 这是唯一真正打上游的路径，由 allModels（首屏）与 refreshModelsAsync 调用。
+//
+// ── 按 realm 分别拉取再取并集（2026-09-23）──
+// 上游按账号所属域下发**不同的模型目录**，实测同一个池里：
+//
+//	CN 账号    → 33~34 个（混元 / DeepSeek / GLM / Kimi）
+//	SaaS 账号  → 22 个（GPT-5.x / Gemini 3.x / 混元 / DeepSeek）
+//
+// 原来的做法是 PickAny 挑**一个**健康账号、拿它的清单就返回 ——
+// 于是「客户端能看到哪些模型」取决于恰好挑中哪个账号，
+// 还会随账号冷却/恢复而跳变（用户体感：模型时有时无）。
+//
+// 现在：按池里出现过的每个 realm 各拉一次，**合并去重**。
+// 网关的语义是「能转发就行」—— 只要某个域能跑某个模型，
+// 它就该出现在清单里；至于当前有没有健康账号能服务它，是另一回事
+// （请求时会按 realm 挑选，选不到会如实报错）。
+//
+// 代价：从「拉 1 次」变成「每个 realm 拉 1 次」（本部署 2 个域）。
+// 但这跑在后台刷新里（见 refreshModelsAsync），不占请求路径。
 func (h *Handler) fetchAndStoreModels() []upstream.Model {
-	// 模型表按账号逐个尝试（最多 MaxRotate 个 healthy 号），取第一个非空结果。
-	// 不能只 Pick() 一个号：临期优先会长期钉在最早到期号上，若该号上游
-	// 模型列表为空（不同账号套餐/订阅可见模型不同），模型表会一直拿不到。
+	realms := h.cfg.Pool.Realms()
+	if len(realms) == 0 {
+		return h.storeFallbackModels(fmt.Errorf("池里没有可用账号"))
+	}
+
+	merged := map[string]upstream.Model{} // id → 模型（去重）
+	var order []string                    // 保持稳定顺序（首次出现的次序）
+	byRealm := map[string]map[string]bool{}
+	var lastErr error
+	got := 0
+
+	for _, realm := range realms {
+		ms, err := h.fetchModelsForRealm(realm)
+		if err != nil || len(ms) == 0 {
+			if err != nil {
+				lastErr = err
+			}
+			log.Printf("models: realm %q 拉取失败/为空：%v", realmLabel(realm), err)
+			continue
+		}
+		got++
+		set := make(map[string]bool, len(ms))
+		for _, m := range ms {
+			set[m.ID] = true
+			if _, dup := merged[m.ID]; dup {
+				continue
+			}
+			merged[m.ID] = m
+			order = append(order, m.ID)
+		}
+		byRealm[realm] = set
+		log.Printf("models: realm %q 拿到 %d 个", realmLabel(realm), len(ms))
+	}
+
+	if got == 0 {
+		// 一个域都没拉到 → 兜底表（短 TTL，等上游恢复）
+		return h.storeFallbackModels(lastErr)
+	}
+	out := make([]upstream.Model, 0, len(order))
+	for _, id := range order {
+		out = append(out, merged[id])
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+
+	// 分域结果与合并清单一起落地：模型页要靠它判断「哪些只在国际域有」。
+	h.modelsMu.Lock()
+	h.modelsByRealm = byRealm
+	h.modelsMu.Unlock()
+
+	log.Printf("models: 合并 %d 个域 → %d 个模型", got, len(out))
+	h.setModels(out, false)
+	return out
+}
+
+// defaultDisabledModel 该模型是否**默认**禁用（用户没显式表态时）。
+//
+// 判定：只在国际域（非 cn）可见、且 cn 域看不到 → 默认禁用。
+// 理由：国内账号服务不了这些模型（实测 gpt-* / gemini-* 只在 saas 域出现），
+// 列在清单里只会让客户端点名请求然后失败。管理员需要时可在模型页开启
+// ——「默认禁用」不是「写死禁用」（modelstate 的 enabled 一档负责这点）。
+//
+// 边界：只有一个域时一律不默认禁用（没有对照，无从判断「国际独有」）；
+// cn 域拉取失败时也不禁用（否则会把「暂时拉不到」误判成「国内没有」，
+// 一次性把一批模型全关掉）。
+func (h *Handler) defaultDisabledModel(id string) bool {
+	h.modelsMu.RLock()
+	byRealm := h.modelsByRealm
+	h.modelsMu.RUnlock()
+
+	cnSet, hasCN := byRealm["cn"]
+	if !hasCN || len(byRealm) < 2 {
+		return false // 没有 cn 对照，或只有一个域 → 不判
+	}
+	if cnSet[id] {
+		return false // 国内也有
+	}
+	// 国内没有，但别的域有 → 国际/其它域独有
+	for realm, set := range byRealm {
+		if realm == "cn" {
+			continue
+		}
+		if set[id] {
+			return true
+		}
+	}
+	return false
+}
+
+// realmLabel 给空 realm 一个能看懂的显示名（老凭证没有 realm 字段）。
+func realmLabel(realm string) string {
+	if realm == "" {
+		return "(无域)"
+	}
+	return realm
+}
+
+// fetchModelsForRealm 在某个域里挑一个可用账号，拉它的模型清单。
+//
+// 同一个域内仍按 MaxRotate 逐个试：临期优先会长期钉在最早到期号上，
+// 若那个号的上游模型列表为空（不同套餐可见模型不同），清单会一直拿不到。
+func (h *Handler) fetchModelsForRealm(realm string) ([]upstream.Model, error) {
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickAny(tried) // 全局模型列表：任意账号皆可（结果对所有人相同）
+		// allowEmpty：realm 为 "" 时把没有 realm 字段的老凭证也算进来
+		acct := h.cfg.Pool.PickRealm(realm, tried, realm == "")
 		if acct == nil {
 			break
 		}
@@ -623,19 +767,20 @@ func (h *Handler) fetchAndStoreModels() []upstream.Model {
 			lastErr = err
 			continue
 		}
-		// 成功拉到非空模型表：缓存并返回
-		h.setModels(ms, false)
-		return ms
+		return ms, nil
 	}
-	// 所有 healthy 号都拉空/失败 → 用兜底模型表。
-	//
-	// **兜底也要写缓存**（2026-09-22 修）：原来这里直接 return，
-	// 缓存仍是空的，于是下一个请求又把上面整个循环重跑一遍 ——
-	// 上游持续返回空时（实测本网关就是），每次 /v1/models 都白等约 500ms，
-	// 而看板每次刷新都调它，页面因此明显变慢。
-	// 用较短的 TTL（modelsFallbackTTL）缓存，兼顾「别白等」与「上游恢复后要能重试」。
-	if lastErr != nil {
-		log.Printf("models: all accounts fetch failed (%v), using fallback table", lastErr)
+	return nil, lastErr
+}
+
+// storeFallbackModels 写兜底表并返回（短 TTL，见 modelsFallbackTTL）。
+//
+// **兜底也要写缓存**（2026-09-22 修）：原来直接 return，缓存仍是空的，
+// 于是下一个请求又把整个拉取循环重跑一遍 —— 上游持续返回空时
+// （实测本网关就是），每次 /v1/models 都白等约 500ms，而看板每次刷新
+// 都调它，页面因此明显变慢。
+func (h *Handler) storeFallbackModels(err error) []upstream.Model {
+	if err != nil {
+		log.Printf("models: all accounts fetch failed (%v), using fallback table", err)
 	}
 	fb := upstream.FallbackModels()
 	h.setModels(fb, true)
