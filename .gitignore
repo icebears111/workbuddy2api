@@ -15,3 +15,4 @@ tmp_*.py
 
 # 配置备份（含 api_key，禁止提交）
 config.json.bak*
+docker-compose.yml.bak*
